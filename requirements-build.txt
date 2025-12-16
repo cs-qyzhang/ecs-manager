@@ -1,0 +1,4 @@
+pyinstaller>=6.10.0
+nuitka>=2.5.0
+
+

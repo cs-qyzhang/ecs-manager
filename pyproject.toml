@@ -1,0 +1,24 @@
+[project]
+name = "ecs"
+version = "0.1.0"
+description = "Manage Codex sessions on Alibaba Cloud ECS"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "typer[all]>=0.12.3",
+  "aliyun-python-sdk-core>=2.13.36",
+  "aliyun-python-sdk-ecs>=4.24.70",
+]
+
+[project.scripts]
+ecs = "ecs.cli:app"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ecs*"]
+
+
