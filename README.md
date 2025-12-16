@@ -1,6 +1,6 @@
 ### ecs — 用阿里云 ECS 管理 Codex session（Python）
 
-本项目 100% 由 GPT-5.2 生成。
+**本项目 100% 由 GPT-5.2 生成。**
 
 `ecs` 是一个本地 CLI：每个 Codex session 对应一台新的阿里云 ECS 实例。它会把 **session -> ECS 实例信息/SSH 连接信息** 保存到本地一个 JSON 文件里（可同步到其他机器继续用）。
 
@@ -149,6 +149,16 @@ ecs create my-session --system-disk-category cloud_essd --system-disk-size 40
 ecs connect my-session
 ```
 
+- 自动写入 SSH 配置（`~/.ssh/config`）：
+  - `ecs create` 成功后会写入一个 `Host ecs-<session>`，之后可直接 `ssh ecs-my-session`
+  - `ecs delete` 会从 `~/.ssh/config` 中移除对应条目
+  - 也可手动管理：
+
+```powershell
+ecs ssh add my-session
+ecs ssh del my-session
+```
+
 - 在本地与 session 之间拷贝文件（scp）：
 
 ```powershell
@@ -258,14 +268,20 @@ PyInstaller 只是打包，不是真正编译；如果你想要更快的启动/�
 - Windows（需要 VS Build Tools 或可用 Nuitka 自动下载工具链）：
 
 ```powershell
-.\scripts\build_windows_nuitka.ps1
+.\scripts\build_windows_nuitka.ps1 -SyncDeps   # 第一次 / 依赖变更时
+.\scripts\build_windows_nuitka.ps1            # 日常增量构建（更快，复用 dist_nuitka 缓存）
+# 如需强制全量重编译：
+.\scripts\build_windows_nuitka.ps1 -Clean
 ```
 
 - macOS（需要先安装 Xcode Command Line Tools：`xcode-select --install`）：
 
 ```bash
 chmod +x scripts/build_macos_nuitka.sh
-./scripts/build_macos_nuitka.sh
+./scripts/build_macos_nuitka.sh 3.12 1   # 第一次 / 依赖变更时（SYNC_DEPS=1）
+./scripts/build_macos_nuitka.sh 3.12 0   # 日常增量构建（复用 dist_nuitka 缓存）
+# 强制全量重编译（CLEAN=1）：
+./scripts/build_macos_nuitka.sh 3.12 0 1
 ```
 
 产物在 `dist_nuitka/`。
@@ -342,5 +358,47 @@ ecs --install-completion
 ```
 
 装完后一般需要新开一个 PowerShell 窗口；之后 session 名参数就可以 Tab 补全了。
+
+如果你遇到“只输入 `ecs` 没有任何输出”的情况，通常是 PowerShell 补全用的环境变量卡住了（`_ECS_COMPLETE`）。
+在当前 PowerShell 执行一次清理即可：
+
+```powershell
+Remove-Item Env:_ECS_COMPLETE -ErrorAction SilentlyContinue
+Remove-Item Env:_TYPER_COMPLETE_ARGS -ErrorAction SilentlyContinue
+Remove-Item Env:_TYPER_COMPLETE_WORD_TO_COMPLETE -ErrorAction SilentlyContinue
+```
+
+## Troubleshooting（常见问题）
+
+### Windows：`ecs` / `ecs scp` 偶发“什么都不输出”
+
+最常见原因是 **PowerShell 补全相关环境变量卡住**（`_ECS_COMPLETE` / `_TYPER_*`），导致 Click/Typer 进入补全模式并直接退出。
+
+- 如果你只是输入 `ecs` 就没输出：按上面清理 3 个 `Env:` 变量即可恢复。
+- 对于真实命令（例如 `ecs scp ...` / `ecs --help`），程序内部也会尽量忽略卡住的补全变量，但如果你的 shell 环境非常混乱，清理一次仍然是最稳的办法。
+
+### Windows：明明更新/拷贝了 `ecs.exe`，但行为像旧版本
+
+很可能是 **PATH 里有多个 `ecs.exe`**，你运行到了另一个旧的。
+
+检查你到底在运行哪个：
+
+```powershell
+Get-Command ecs -All | Format-Table Name,Source
+```
+
+如果你用的是 venv 版本，可以显式运行：
+
+```powershell
+.\.venv\Scripts\ecs.exe --help
+```
+
+### `ecs scp` 没拷贝成功 / 看起来“没反应”
+
+`ecs scp` 会直接调用系统 `scp`。如果失败会输出 **exit code** 和执行的命令，建议加 verbose 观察原因：
+
+```powershell
+ecs scp my-session .\file.txt :/root/file.txt -- -v
+```
 
 

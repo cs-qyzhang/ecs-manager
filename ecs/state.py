@@ -57,6 +57,9 @@ def default_config() -> dict[str, Any]:
         "ssh_user": "root",
         "ssh_private_key_path": "",
         "ssh_strict_host_key_checking": False,
+        # SSH config integration (~/.ssh/config)
+        "auto_ssh_config": True,
+        "ssh_config_host_prefix": "ecs-",
         # Polling / timeouts
         "timeout_seconds": 600,
         "poll_interval_seconds": 5,

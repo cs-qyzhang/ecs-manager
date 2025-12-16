@@ -1,5 +1,7 @@
 param(
-  [string]$Python = "3.12"
+  [string]$Python = "3.12",
+  [switch]$SyncDeps,
+  [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,10 +15,13 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 
 if (-not (Test-Path ".venv")) {
   uv venv --python $Python
+  $SyncDeps = $true
 }
 
-uv sync
-uv pip install -r requirements-build.txt
+if ($SyncDeps) {
+  uv sync
+  uv pip install -r requirements-build.txt
+}
 
 # Nuitka builds native code. On Windows you need a C compiler toolchain.
 # Easiest: Visual Studio Build Tools, or use MinGW64 via --mingw64 (Nuitka may download).
@@ -24,6 +29,13 @@ uv pip install -r requirements-build.txt
 $pythonExe = Join-Path $repo ".venv\\Scripts\\python.exe"
 if (-not (Test-Path $pythonExe)) {
   throw "python.exe not found at $pythonExe"
+}
+
+# Optional clean build (forces recompilation)
+if ($Clean) {
+  if (Test-Path "dist_nuitka\\__main__.build") { Remove-Item -Recurse -Force "dist_nuitka\\__main__.build" }
+  if (Test-Path "dist_nuitka\\__main__.dist") { Remove-Item -Recurse -Force "dist_nuitka\\__main__.dist" }
+  if (Test-Path "dist_nuitka\\__main__.onefile-build") { Remove-Item -Recurse -Force "dist_nuitka\\__main__.onefile-build" }
 }
 
 # Include aliyunsdkcore/data/*.json (Nuitka does not reliably include package data automatically)

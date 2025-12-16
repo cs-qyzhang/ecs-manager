@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 def _suppress_noisy_ssl_warnings() -> None:
@@ -101,6 +102,26 @@ def _load_dotenv_early() -> None:
 _load_dotenv_early()
 _suppress_noisy_ssl_warnings()
 
+
+def _sanitize_stuck_completion_env() -> None:
+    """
+    PowerShell completion invokes `ecs` in a subprocess with special env vars
+    (e.g. _ECS_COMPLETE, _TYPER_COMPLETE_ARGS). If a completion invocation is
+    interrupted, these vars can get stuck in the *parent shell*, making normal
+    commands output nothing.
+
+    For real user commands (argv has extra args like `scp`, `--help`, etc.),
+    always ignore those vars so the CLI stays usable.
+    """
+
+    if len(sys.argv) > 1:
+        os.environ.pop("_ECS_COMPLETE", None)
+        os.environ.pop("_TYPER_COMPLETE_ARGS", None)
+        os.environ.pop("_TYPER_COMPLETE_WORD_TO_COMPLETE", None)
+
+
+_sanitize_stuck_completion_env()
+
 import json
 import subprocess
 from typing import Any
@@ -122,6 +143,7 @@ from .aliyun_ecs import (
     wait_instance_status,
 )
 from .state import default_config, default_state_path, load_state, resolve_state_path, save_state
+from .ssh_config import SshConfigEntry, default_host_alias, remove as ssh_config_remove, ssh_config_path, upsert as ssh_config_upsert
 from .util import coerce_value, format_cmd, normalize_region_id, now_iso_utc, null_device
 
 
@@ -132,6 +154,9 @@ app = typer.Typer(
 
 config_app = typer.Typer(help="Manage defaults stored in the JSON state file.")
 app.add_typer(config_app, name="config")
+
+ssh_app = typer.Typer(help="Manage ~/.ssh/config entries for sessions.")
+app.add_typer(ssh_app, name="ssh")
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -608,6 +633,28 @@ def create(
             )
         else:
             typer.echo(f"Ready: {name} -> instance {instance_id}")
+
+        # Auto-add ssh config entry
+        if bool(cfg.get("auto_ssh_config", True)):
+            ip = record.get("public_ip") or record.get("private_ip")
+            key_path_str = str(cfg.get("ssh_private_key_path") or "").strip()
+            if ip and key_path_str:
+                alias = default_host_alias(name, prefix=str(cfg.get("ssh_config_host_prefix") or "ecs-"))
+                entry = SshConfigEntry(
+                    session_name=name,
+                    host_alias=alias,
+                    host_name=str(ip),
+                    user=str(record.get("ssh_user") or cfg.get("ssh_user") or "root"),
+                    identity_file=key_path_str,
+                    forward_agent=True,
+                    identities_only=True,
+                    strict_host_key_checking=bool(cfg.get("ssh_strict_host_key_checking")),
+                )
+                try:
+                    ssh_config_upsert(ssh_config_path(), entry)
+                    typer.echo(f"SSH config added: Host {alias} (file: {ssh_config_path()})")
+                except Exception as e:
+                    typer.echo(f"Warning: failed to update ~/.ssh/config: {e}", err=True)
     except TimeoutError as e:
         typer.echo(str(e), err=True)
         typer.echo(
@@ -1149,7 +1196,12 @@ def scp(
         raise typer.Exit(0)
 
     try:
-        raise typer.Exit(subprocess.call(cmd))
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            typer.echo(f"scp failed (exit code {rc}).", err=True)
+            typer.echo(f"Command: {format_cmd(cmd)}", err=True)
+            typer.echo("Tip: add verbose flags, e.g. `ecs scp ... -- -v`.", err=True)
+        raise typer.Exit(rc)
     except FileNotFoundError:
         _die("`scp` not found in PATH. Install OpenSSH client (Windows: Optional Features) or ensure scp is available.")
 
@@ -1188,6 +1240,12 @@ def delete(
         _die(str(e))
     except Exception as e:
         _die(f"Aliyun API error: {e}")
+
+    # Best-effort remove ssh config entry even if we keep the record.
+    try:
+        ssh_config_remove(ssh_config_path(), name)
+    except Exception:
+        pass
 
     if not keep_record:
         sessions.pop(name, None)
@@ -1353,5 +1411,81 @@ def start(
         except TimeoutError as e:
             typer.echo(str(e), err=True)
             typer.echo("Tip: run `ecs sync` or `ecs info <name>` later.")
+
+
+@ssh_app.command("add")
+def ssh_add(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+    private: bool = typer.Option(False, "--private", help="Use private IP instead of public IP."),
+    refresh: bool = typer.Option(True, "--refresh/--no-refresh", help="Refresh IP/status from Aliyun before writing config."),
+    host_alias: str | None = typer.Option(None, "--host", help="Override Host alias written to ~/.ssh/config."),
+) -> None:
+    """Add/update one session entry in ~/.ssh/config."""
+    path, state = _load(ctx)
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+    sess = sessions.get(name)
+    if not isinstance(sess, dict):
+        _die(f"Session not found: {name}")
+
+    cfg = state.get("config") or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    region = str(sess.get("region_id") or cfg.get("region_id") or "")
+    instance_id = str(sess.get("instance_id") or "")
+    if not instance_id:
+        _die(f"Session record missing instance_id: {name}")
+
+    if refresh:
+        try:
+            info_obj = describe_instance(region_id=region, instance_id=instance_id)
+            if info_obj:
+                sess["status"] = info_obj.status
+                if info_obj.public_ip:
+                    sess["public_ip"] = info_obj.public_ip
+                if info_obj.private_ip:
+                    sess["private_ip"] = info_obj.private_ip
+                sess["last_refresh_at"] = now_iso_utc()
+                _save(path, state)
+        except Exception as e:
+            typer.echo(f"Warning: refresh failed: {e}", err=True)
+
+    ip = sess.get("private_ip") if private else sess.get("public_ip")
+    if not ip:
+        _die("No IP available for this session. Use --private or run `ecs public-ip <name>` first.")
+
+    key_path_str = str(cfg.get("ssh_private_key_path") or "").strip()
+    if not key_path_str:
+        _die("Missing config ssh_private_key_path. Set it via: ecs config set ssh_private_key_path=...")
+
+    alias = host_alias or default_host_alias(name, prefix=str(cfg.get("ssh_config_host_prefix") or "ecs-"))
+    entry = SshConfigEntry(
+        session_name=name,
+        host_alias=alias,
+        host_name=str(ip),
+        user=str(sess.get("ssh_user") or cfg.get("ssh_user") or "root"),
+        identity_file=key_path_str,
+        forward_agent=True,
+        identities_only=True,
+        strict_host_key_checking=bool(cfg.get("ssh_strict_host_key_checking")),
+    )
+    ssh_config_upsert(ssh_config_path(), entry)
+    typer.echo(f"OK (added): Host {alias} -> {entry.user}@{entry.host_name}")
+
+
+@ssh_app.command("del")
+def ssh_del(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+) -> None:
+    """Remove one session entry from ~/.ssh/config."""
+    removed = ssh_config_remove(ssh_config_path(), name)
+    if removed:
+        typer.echo("OK")
+    else:
+        typer.echo("Not found")
 
 
