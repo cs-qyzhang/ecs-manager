@@ -67,6 +67,7 @@ def create_instance(
     v_switch_id: str,
     key_pair_name: str,
     instance_name: str,
+    hostname: str | None = None,
     tags: list[dict[str, str]] | None = None,
     system_disk_category: str | None = None,
     system_disk_size: int | None = None,
@@ -93,6 +94,12 @@ def create_instance(
     req.set_KeyPairName(key_pair_name)
     req.set_InstanceName(instance_name)
     req.set_InstanceChargeType("PostPaid")
+
+    if hostname:
+        if hasattr(req, "set_HostName"):
+            req.set_HostName(hostname)
+        else:
+            raise EcsError("SDK does not support HostName on CreateInstanceRequest")
 
     if tags:
         # SDK encodes into Tag.1.Key/Tag.1.Value...

@@ -45,6 +45,9 @@ def default_config() -> dict[str, Any]:
         "auto_allocate_public_ip": True,
         "internet_charge_type": "PayByTraffic",
         "internet_max_bandwidth_out": 10,
+        # Hostname
+        # If true, `ecs create` will set the instance OS hostname (HostName) to a sanitized session name.
+        "set_hostname_to_session": True,
         # Spot / preemptible instances
         # - NoSpot (default in ECS): normal pay-as-you-go
         # - SpotAsPriceGo: preemptible, auto bidding (recommended)
@@ -75,6 +78,7 @@ def new_state() -> dict[str, Any]:
         "version": 1,
         "created_at": now_iso_utc(),
         "config": default_config(),
+        "templates": {},  # name -> template record
         "sessions": {},  # name -> session record
     }
 
@@ -96,6 +100,11 @@ def normalize_state(raw: Any) -> dict[str, Any]:
     if not isinstance(sessions, dict):
         sessions = {}
     base["sessions"] = sessions
+
+    templates = base.get("templates")
+    if not isinstance(templates, dict):
+        templates = {}
+    base["templates"] = templates
 
     if "version" not in base:
         base["version"] = 1

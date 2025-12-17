@@ -144,7 +144,7 @@ from .aliyun_ecs import (
 )
 from .state import default_config, default_state_path, load_state, resolve_state_path, save_state
 from .ssh_config import SshConfigEntry, default_host_alias, remove as ssh_config_remove, ssh_config_path, upsert as ssh_config_upsert
-from .util import coerce_value, format_cmd, normalize_region_id, now_iso_utc, null_device
+from .util import coerce_value, format_cmd, normalize_region_id, now_iso_utc, null_device, sanitize_hostname
 
 
 app = typer.Typer(
@@ -157,6 +157,9 @@ app.add_typer(config_app, name="config")
 
 ssh_app = typer.Typer(help="Manage ~/.ssh/config entries for sessions.")
 app.add_typer(ssh_app, name="ssh")
+
+template_app = typer.Typer(help="Manage reusable create templates stored in the state file.")
+app.add_typer(template_app, name="template")
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -218,6 +221,35 @@ def _complete_session_names(incomplete: str) -> list[str]:
         return []
 
 
+def _complete_template_names(incomplete: str) -> list[str]:
+    try:
+        state_path = default_state_path()
+        try:
+            import shlex
+
+            args_str = os.getenv("_TYPER_COMPLETE_ARGS") or ""
+            if args_str:
+                parts = shlex.split(args_str, posix=False)
+                for i, p in enumerate(parts):
+                    if p.startswith("--state-file="):
+                        state_path = Path(p.split("=", 1)[1]).expanduser()
+                        break
+                    if p == "--state-file" and i + 1 < len(parts):
+                        state_path = Path(parts[i + 1]).expanduser()
+                        break
+        except Exception:
+            pass
+
+        state = load_state(state_path)
+        templates = state.get("templates") or {}
+        if not isinstance(templates, dict):
+            return []
+        names = sorted(str(k) for k in templates.keys())
+        return [n for n in names if n.startswith(incomplete)]
+    except Exception:
+        return []
+
+
 @app.callback()
 def _main(
     ctx: typer.Context,
@@ -236,6 +268,135 @@ def _main(
 def path(ctx: typer.Context) -> None:
     """Print the resolved state file path."""
     typer.echo(str(_get_state_path_from_ctx(ctx)))
+
+
+@template_app.command("list")
+def template_list(ctx: typer.Context) -> None:
+    """List templates (from the local JSON state file)."""
+    _, state = _load(ctx)
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+    if not templates:
+        typer.echo("No templates.")
+        return
+
+    rows: list[tuple[str, str]] = []
+    for name, rec in templates.items():
+        desc = ""
+        if isinstance(rec, dict):
+            d = rec.get("description")
+            if isinstance(d, str):
+                desc = d
+        rows.append((str(name), desc))
+
+    name_w = max(len(r[0]) for r in rows)
+    typer.echo(f"{'NAME'.ljust(name_w)}  DESCRIPTION")
+    typer.echo("-" * (name_w + 2 + len("DESCRIPTION")))
+    for n, d in sorted(rows, key=lambda x: x[0]):
+        typer.echo(f"{n.ljust(name_w)}  {d}")
+
+
+@template_app.command("show")
+def template_show(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_template_names),
+) -> None:
+    """Show one template record as JSON."""
+    _, state = _load(ctx)
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+    rec = templates.get(name)
+    if not isinstance(rec, dict):
+        _die(f"Template not found: {name}")
+    typer.echo(json.dumps(rec, ensure_ascii=False, indent=2))
+
+
+@template_app.command("set")
+def template_set(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Template name."),
+    pairs: list[str] = typer.Argument(
+        ...,
+        help="One or more key=value pairs for create defaults, e.g. region_id=cn-hangzhou image_id=... instance_type=... spot_strategy=NoSpot",
+    ),
+    description: str | None = typer.Option(None, "--description", "-d", help="Optional description."),
+) -> None:
+    """Create or update a template."""
+    path, state = _load(ctx)
+    templates = state.get("templates")
+    if not isinstance(templates, dict):
+        templates = {}
+        state["templates"] = templates
+
+    rec = templates.get(name)
+    if not isinstance(rec, dict):
+        rec = {"name": name, "created_at": now_iso_utc(), "updated_at": now_iso_utc(), "description": "", "config": {}}
+        templates[name] = rec
+
+    cfg = rec.get("config")
+    if not isinstance(cfg, dict):
+        cfg = {}
+        rec["config"] = cfg
+
+    if description is not None:
+        rec["description"] = str(description)
+
+    for raw in pairs:
+        if "=" not in raw:
+            _die(f"Invalid pair (expected key=value): {raw}")
+        k, v = raw.split("=", 1)
+        k = k.strip()
+        if not k:
+            _die(f"Invalid key in pair: {raw}")
+        cfg[k] = coerce_value(v)
+
+    rec["updated_at"] = now_iso_utc()
+    _save(path, state)
+    typer.echo("OK")
+
+
+@template_app.command("unset")
+def template_unset(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_template_names),
+    keys: list[str] = typer.Argument(..., help="One or more keys to remove from the template."),
+) -> None:
+    """Remove keys from a template."""
+    path, state = _load(ctx)
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+    rec = templates.get(name)
+    if not isinstance(rec, dict):
+        _die(f"Template not found: {name}")
+    cfg = rec.get("config")
+    if not isinstance(cfg, dict):
+        cfg = {}
+        rec["config"] = cfg
+    for k in keys:
+        cfg.pop(str(k), None)
+    rec["updated_at"] = now_iso_utc()
+    _save(path, state)
+    typer.echo("OK")
+
+
+@template_app.command("delete")
+def template_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_template_names),
+) -> None:
+    """Delete a template."""
+    path, state = _load(ctx)
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+    if name not in templates:
+        _die(f"Template not found: {name}")
+    templates.pop(name, None)
+    _save(path, state)
+    typer.echo("OK")
 
 
 @config_app.command("show")
@@ -337,6 +498,22 @@ def info(
 def create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Session name (used as the ECS InstanceName)."),
+    template: str | None = typer.Option(
+        None,
+        "--template",
+        autocompletion=_complete_template_names,
+        help="Template name (from `ecs template`). Template config is used as defaults for create; CLI flags override.",
+    ),
+    hostname: str | None = typer.Option(
+        None,
+        "--hostname",
+        help="Set ECS HostName (instance OS hostname). If omitted, it can be derived from the session name (see --hostname-to-session).",
+    ),
+    hostname_to_session: bool | None = typer.Option(
+        None,
+        "--hostname-to-session/--no-hostname-to-session",
+        help="Set HostName to a sanitized session name. Default from config set_hostname_to_session.",
+    ),
     # Optional overrides (default from config):
     region_id: str | None = typer.Option(None, "--region-id"),
     image_id: str | None = typer.Option(None, "--image-id"),
@@ -404,12 +581,27 @@ def create(
     if not isinstance(cfg, dict):
         cfg = {}
 
-    region = region_id or cfg.get("region_id") or ""
-    image = image_id or cfg.get("image_id") or ""
-    itype = instance_type or cfg.get("instance_type") or ""
-    sg = security_group_id or cfg.get("security_group_id") or ""
-    vsw = v_switch_id or cfg.get("v_switch_id") or ""
-    keypair = key_pair_name or cfg.get("key_pair_name") or ""
+    effective_cfg: dict[str, Any] = dict(cfg)
+    template_name = (template or "").strip() or None
+    if template_name:
+        templates = state.get("templates") or {}
+        if not isinstance(templates, dict):
+            _die("State file is corrupted: templates is not a dict.")
+        trec = templates.get(template_name)
+        if not isinstance(trec, dict):
+            _die(f"Template not found: {template_name}")
+        tcfg = trec.get("config") or {}
+        if not isinstance(tcfg, dict):
+            _die(f"Template {template_name!r} is corrupted: config is not a dict.")
+        # Merge: global config < template config < CLI flags
+        effective_cfg.update(tcfg)
+
+    region = region_id or effective_cfg.get("region_id") or ""
+    image = image_id or effective_cfg.get("image_id") or ""
+    itype = instance_type or effective_cfg.get("instance_type") or ""
+    sg = security_group_id or effective_cfg.get("security_group_id") or ""
+    vsw = v_switch_id or effective_cfg.get("v_switch_id") or ""
+    keypair = key_pair_name or effective_cfg.get("key_pair_name") or ""
 
     region = _require(str(region), "region_id")
     normalized_region, original_zone = normalize_region_id(region)
@@ -429,41 +621,64 @@ def create(
     bw = (
         internet_max_bandwidth_out
         if internet_max_bandwidth_out is not None
-        else cfg.get("internet_max_bandwidth_out")
+        else effective_cfg.get("internet_max_bandwidth_out")
     )
-    charge_type = internet_charge_type or cfg.get("internet_charge_type") or "PayByTraffic"
+    charge_type = internet_charge_type or effective_cfg.get("internet_charge_type") or "PayByTraffic"
     allocate_public_ip_final = (
         bool(allocate_public_ip)
         if allocate_public_ip is not None
-        else bool(cfg.get("auto_allocate_public_ip", True))
+        else bool(effective_cfg.get("auto_allocate_public_ip", True))
     )
 
-    sys_disk_cat = system_disk_category if system_disk_category is not None else cfg.get("system_disk_category")
+    sys_disk_cat = (
+        system_disk_category if system_disk_category is not None else effective_cfg.get("system_disk_category")
+    )
     if sys_disk_cat is not None:
         sys_disk_cat = str(sys_disk_cat).strip() or None
-    sys_disk_size = system_disk_size if system_disk_size is not None else cfg.get("system_disk_size")
+    sys_disk_size = system_disk_size if system_disk_size is not None else effective_cfg.get("system_disk_size")
     sys_disk_pl = (
         system_disk_performance_level
         if system_disk_performance_level is not None
-        else cfg.get("system_disk_performance_level")
+        else effective_cfg.get("system_disk_performance_level")
     )
     if sys_disk_pl is not None:
         sys_disk_pl = str(sys_disk_pl).strip() or None
 
-    spot_strategy_final = spot_strategy or cfg.get("spot_strategy") or "SpotAsPriceGo"
+    spot_strategy_final = spot_strategy or effective_cfg.get("spot_strategy") or "SpotAsPriceGo"
     spot_price_limit_final = (
-        spot_price_limit if spot_price_limit is not None else cfg.get("spot_price_limit")
+        spot_price_limit if spot_price_limit is not None else effective_cfg.get("spot_price_limit")
     )
-    spot_duration_final = spot_duration if spot_duration is not None else cfg.get("spot_duration")
+    spot_duration_final = spot_duration if spot_duration is not None else effective_cfg.get("spot_duration")
     spot_interruption_behavior_final = (
         spot_interruption_behavior
         if spot_interruption_behavior is not None
-        else cfg.get("spot_interruption_behavior")
+        else effective_cfg.get("spot_interruption_behavior")
     )
 
-    ssh_user_final = ssh_user or cfg.get("ssh_user") or "root"
-    timeout_final = int(timeout_seconds or cfg.get("timeout_seconds") or 600)
-    poll_final = int(poll_interval_seconds or cfg.get("poll_interval_seconds") or 5)
+    ssh_user_final = ssh_user or effective_cfg.get("ssh_user") or "root"
+    timeout_final = int(timeout_seconds or effective_cfg.get("timeout_seconds") or 600)
+    poll_final = int(poll_interval_seconds or effective_cfg.get("poll_interval_seconds") or 5)
+
+    hostname_to_session_final = (
+        bool(hostname_to_session)
+        if hostname_to_session is not None
+        else bool(effective_cfg.get("set_hostname_to_session", True))
+    )
+    hostname_final: str | None = None
+    hostname_raw = hostname if hostname is not None else effective_cfg.get("hostname")
+    if hostname_raw is not None and str(hostname_raw).strip() != "":
+        hostname_final = sanitize_hostname(str(hostname_raw))
+        if hostname_final != str(hostname_raw).strip().lower():
+            typer.echo(
+                f"Warning: hostname normalized to {hostname_final!r} from {str(hostname_raw)!r}",
+                err=True,
+            )
+    elif hostname_to_session_final:
+        hostname_final = sanitize_hostname(name)
+        if hostname_final != name.strip().lower():
+            typer.echo(
+                f"Info: hostname set to {hostname_final!r} (sanitized from session name {name!r})",
+            )
 
     def _try_create_with_disk_category(cat: str | None) -> str:
         return create_instance(
@@ -474,6 +689,7 @@ def create(
             v_switch_id=vsw,
             key_pair_name=keypair,
             instance_name=name,
+            hostname=hostname_final,
             tags=[
                 {"Key": "ecs", "Value": "true"},
                 {"Key": "ecs_session", "Value": name},
@@ -533,11 +749,13 @@ def create(
 
     record: dict[str, Any] = {
         "name": name,
+        "template": template_name,
         "region_id": region,
         "instance_id": instance_id,
         "image_id": image,
         "instance_type": itype,
         "instance_name": name,
+        "hostname": hostname_final,
         "key_pair_name": keypair,
         "system_disk_category": sys_disk_cat,
         "system_disk_size": int(sys_disk_size) if sys_disk_size is not None else None,

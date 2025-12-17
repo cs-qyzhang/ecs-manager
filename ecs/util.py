@@ -88,3 +88,45 @@ def normalize_region_id(value: str) -> tuple[str, str | None]:
     return s, None
 
 
+_HOSTNAME_ALLOWED = re.compile(r"[^a-z0-9-]+")
+_HOSTNAME_DASHES = re.compile(r"-{2,}")
+
+
+def sanitize_hostname(value: str, *, max_len: int = 63) -> str:
+    """
+    Convert an arbitrary string into a reasonably safe Linux hostname label.
+
+    - Lowercase a-z0-9 and '-'
+    - Trim leading/trailing '-'
+    - Ensure starts/ends with alnum
+    - Clamp to max_len (default 63, safe for most tooling/DNS label)
+    """
+    s = (value or "").strip().lower()
+    s = s.replace("_", "-").replace(".", "-").replace(" ", "-")
+    s = _HOSTNAME_ALLOWED.sub("-", s)
+    s = _HOSTNAME_DASHES.sub("-", s)
+    s = s.strip("-")
+
+    if not s:
+        s = "ecs"
+
+    # Ensure starts with alnum
+    if not s[0].isalnum():
+        s = f"ecs-{s}".strip("-")
+
+    # Clamp length
+    s = s[: max(1, int(max_len))]
+    s = s.strip("-")
+
+    # Ensure ends with alnum
+    while s and not s[-1].isalnum():
+        s = s[:-1]
+    if not s:
+        s = "ecs"
+
+    # Many providers require length 2-64; pad to 2 if needed.
+    if len(s) == 1:
+        s = s + "0"
+    return s
+
+

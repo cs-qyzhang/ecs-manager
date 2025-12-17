@@ -401,4 +401,52 @@ Get-Command ecs -All | Format-Table Name,Source
 ecs scp my-session .\file.txt :/root/file.txt -- -v
 ```
 
+## HostName（把实例主机名设为 session 名）
+
+默认情况下，`ecs create` 会把 **ECS InstanceName** 设为 session 名，同时把 **HostName（OS hostname）** 也设为一个“从 session 名清洗得到”的值（仅 `a-z0-9-`，并截断到安全长度）。
+
+- 自定义 hostname：
+
+```bash
+ecs create my-session --hostname my-host
+```
+
+- 关闭“hostname=session”：
+
+```bash
+ecs create my-session --no-hostname-to-session
+```
+
+## Templates（创建模板）
+
+当你需要用不同的镜像 / 规格 / VPC / 抢占策略快速启动不同类型的实例时，可以先把这些“默认参数”存成模板，然后在创建时选择模板。
+
+### 创建/更新模板
+
+```bash
+# 保存一组 create 默认参数
+ecs template set gpu region_id=cn-hangzhou image_id=... instance_type=ecs.gn6i-c4g1.xlarge security_group_id=... v_switch_id=... spot_strategy=SpotAsPriceGo
+
+# 可选：加描述
+ecs template set cpu region_id=cn-hangzhou image_id=... instance_type=ecs.c7.large -d "cheap cpu sandbox"
+```
+
+### 查看/列出模板
+
+```bash
+ecs template list
+ecs template show gpu
+```
+
+### 用模板创建
+
+模板会作为默认值参与合并，优先级为：**全局 config < template < CLI flags**。
+
+```bash
+ecs create sess-001 --template gpu
+
+# 仍然可以用 CLI 覆盖模板中的某个值
+ecs create sess-002 --template gpu --spot-strategy NoSpot
+```
+
 
