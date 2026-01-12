@@ -14,6 +14,9 @@ from aliyunsdkecs.request.v20140526.DescribeRegionsRequest import DescribeRegion
 from aliyunsdkecs.request.v20140526.StartInstanceRequest import StartInstanceRequest
 from aliyunsdkecs.request.v20140526.StopInstanceRequest import StopInstanceRequest
 from aliyunsdkecs.request.v20140526.AllocatePublicIpAddressRequest import AllocatePublicIpAddressRequest
+from aliyunsdkecs.request.v20140526.AuthorizeSecurityGroupRequest import AuthorizeSecurityGroupRequest
+from aliyunsdkecs.request.v20140526.RevokeSecurityGroupRequest import RevokeSecurityGroupRequest
+from aliyunsdkecs.request.v20140526.DescribeSecurityGroupAttributeRequest import DescribeSecurityGroupAttributeRequest
 
 from .util import normalize_region_id
 
@@ -449,3 +452,127 @@ def wait_instance_status(
     )
 
 
+def get_instance_security_group_id(*, region_id: str, instance_id: str) -> str | None:
+    """Get the first security group ID for an instance."""
+    info = describe_instance(region_id=region_id, instance_id=instance_id)
+    if not info:
+        return None
+    
+    # Try to get from SecurityGroupIds
+    raw = info.raw
+    sg_ids = raw.get("SecurityGroupIds") or {}
+    sg_list = sg_ids.get("SecurityGroupId") or []
+    
+    if isinstance(sg_list, list) and sg_list:
+        sg_id = sg_list[0]
+        if isinstance(sg_id, str) and sg_id:
+            return sg_id
+    
+    # Try from SecurityGroupId (singular, older format)
+    sg_id = raw.get("SecurityGroupId")
+    if isinstance(sg_id, str) and sg_id:
+        return sg_id
+    
+    return None
+
+
+@dataclass(frozen=True)
+class SecurityGroupRule:
+    """Represents a security group ingress rule."""
+    port_range: str  # e.g., "80/80", "22/22"
+    protocol: str  # e.g., "tcp", "udp"
+    source_cidr: str  # e.g., "0.0.0.0/0"
+    description: str | None
+    rule_id: str | None
+
+
+def list_security_group_rules(*, region_id: str, security_group_id: str) -> list[SecurityGroupRule]:
+    """List ingress rules for a security group."""
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+    
+    req = DescribeSecurityGroupAttributeRequest()
+    if hasattr(req, "set_RegionId"):
+        req.set_RegionId(region_id)
+    req.set_SecurityGroupId(security_group_id)
+    req.set_Direction("ingress")
+    
+    resp = _do_action_json(client, req)
+    
+    rules = []
+    permissions = (resp.get("Permissions") or {}).get("Permission") or []
+    if isinstance(permissions, dict):
+        permissions = [permissions]
+    
+    if isinstance(permissions, list):
+        for perm in permissions:
+            if not isinstance(perm, dict):
+                continue
+            
+            port_range = perm.get("PortRange") or ""
+            protocol = perm.get("IpProtocol") or ""
+            source_cidr = perm.get("SourceCidrIp") or ""
+            description = perm.get("Description")
+            rule_id = perm.get("SecurityGroupRuleId")
+            
+            if port_range and protocol:
+                rules.append(
+                    SecurityGroupRule(
+                        port_range=str(port_range),
+                        protocol=str(protocol).lower(),
+                        source_cidr=str(source_cidr) or "0.0.0.0/0",
+                        description=str(description) if description else None,
+                        rule_id=str(rule_id) if rule_id else None,
+                    )
+                )
+    
+    return rules
+
+
+def authorize_security_group_rule(
+    *,
+    region_id: str,
+    security_group_id: str,
+    port: int,
+    protocol: str = "tcp",
+    source_cidr: str = "0.0.0.0/0",
+    description: str | None = None,
+) -> None:
+    """Add an ingress rule to a security group."""
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+    
+    req = AuthorizeSecurityGroupRequest()
+    if hasattr(req, "set_RegionId"):
+        req.set_RegionId(region_id)
+    req.set_SecurityGroupId(security_group_id)
+    req.set_IpProtocol(protocol.lower())
+    req.set_PortRange(f"{port}/{port}")
+    req.set_SourceCidrIp(source_cidr)
+    if description:
+        req.set_Description(description)
+    
+    _do_action_json(client, req)
+
+
+def revoke_security_group_rule(
+    *,
+    region_id: str,
+    security_group_id: str,
+    port: int,
+    protocol: str = "tcp",
+    source_cidr: str = "0.0.0.0/0",
+) -> None:
+    """Remove an ingress rule from a security group."""
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+    
+    req = RevokeSecurityGroupRequest()
+    if hasattr(req, "set_RegionId"):
+        req.set_RegionId(region_id)
+    req.set_SecurityGroupId(security_group_id)
+    req.set_IpProtocol(protocol.lower())
+    req.set_PortRange(f"{port}/{port}")
+    req.set_SourceCidrIp(source_cidr)
+    
+    _do_action_json(client, req)

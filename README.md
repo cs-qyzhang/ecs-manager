@@ -212,6 +212,62 @@ ecs stop my-session --mode keep-charging
 ecs start my-session
 ```
 
+## 端口控制（Security Group 规则）
+
+`ecs` 提供了便捷的命令来管理实例的安全组端口规则（入站规则）。
+
+### 列出已开放的端口
+
+```powershell
+ecs port list my-session
+```
+
+输出示例：
+```
+Security Group: sg-xxxxx
+PORT RANGE   PROTO  SOURCE            DESCRIPTION
+----------------------------------------------------------------------
+22/22        TCP    0.0.0.0/0         SSH access
+80/80        TCP    0.0.0.0/0         HTTP
+443/443      TCP    0.0.0.0/0         HTTPS
+8080/8080    TCP    0.0.0.0/0         Custom service
+```
+
+### 开放端口
+
+```powershell
+# 开放 TCP 80 端口（默认协议为 tcp，默认来源为 0.0.0.0/0）
+ecs port open my-session 80
+
+# 开放 UDP 53 端口
+ecs port open my-session 53 --protocol udp
+
+# 开放端口并指定来源 IP 段
+ecs port open my-session 8080 --source 192.168.1.0/24
+
+# 开放端口并添加描述
+ecs port open my-session 443 --description "HTTPS access"
+```
+
+### 关闭端口
+
+```powershell
+# 关闭 TCP 80 端口（默认协议为 tcp，默认来源为 0.0.0.0/0）
+ecs port close my-session 80
+
+# 关闭 UDP 53 端口
+ecs port close my-session 53 --protocol udp
+
+# 关闭指定来源的端口规则
+ecs port close my-session 8080 --source 192.168.1.0/24
+```
+
+**注意**：
+- 端口范围：1-65535
+- 支持的协议：`tcp`、`udp`、`icmp`、`gre`、`all`（默认：`tcp`）
+- 来源 CIDR：默认为 `0.0.0.0/0`（允许所有 IP），可以指定特定 IP 段
+- 这些命令操作的是实例所属安全组的**入站规则**（ingress rules）
+
 ## 同步 state（防止手动删实例导致本地记录过期）
 
 如果你在控制台/其他机器上手动删除了 ECS 实例，本地 `state.json` 可能还保留旧 session。

@@ -132,11 +132,15 @@ from aliyunsdkcore.acs_exception.exceptions import ServerException
 from .aliyun_ecs import (
     EcsError,
     allocate_public_ip_address,
+    authorize_security_group_rule,
     create_instance,
     delete_instance,
     describe_instance,
+    get_instance_security_group_id,
     list_instances,
     list_regions,
+    list_security_group_rules,
+    revoke_security_group_rule,
     start_instance,
     stop_instance,
     wait_instance,
@@ -160,6 +164,9 @@ app.add_typer(ssh_app, name="ssh")
 
 template_app = typer.Typer(help="Manage reusable create templates stored in the state file.")
 app.add_typer(template_app, name="template")
+
+port_app = typer.Typer(help="Manage security group port rules for instances.")
+app.add_typer(port_app, name="port")
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -966,14 +973,14 @@ def sync(
         help="Query all regions returned by DescribeRegions (may take longer).",
     ),
     prune_missing: bool = typer.Option(
-        False,
+        True,
         "--prune/--no-prune",
-        help="Remove local sessions whose instances no longer exist.",
+        help="Remove local sessions whose instances no longer exist (default: enabled).",
     ),
     import_new: bool = typer.Option(
-        False,
+        True,
         "--import/--no-import",
-        help="Import instances that are not present in local state.",
+        help="Import instances that are not present in local state (default: enabled).",
     ),
     import_all: bool = typer.Option(
         False,
@@ -985,8 +992,8 @@ def sync(
     Sync local state with Aliyun ECS.
 
     - Refresh status/IP for sessions in state.json
-    - Detect instances deleted manually (mark NotFound or prune)
-    - Optionally import instances from the cloud into state.json
+    - Automatically remove local sessions whose instances no longer exist (default: enabled)
+    - Automatically import instances from the cloud that are not in local state (default: enabled, only instances tagged ecs=true)
     """
     path, state = _load(ctx)
     sessions = state.get("sessions") or {}
@@ -1706,4 +1713,167 @@ def ssh_del(
     else:
         typer.echo("Not found")
 
+
+@port_app.command("list")
+def port_list(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+) -> None:
+    """List open ports (ingress rules) for a session's security group."""
+    _, state = _load(ctx)
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+    
+    sess = sessions.get(name)
+    if not isinstance(sess, dict):
+        _die(f"Session not found: {name}")
+    
+    region = str(sess.get("region_id") or "")
+    instance_id = str(sess.get("instance_id") or "")
+    if not region or not instance_id:
+        _die(f"Session record missing region_id/instance_id: {name}")
+    
+    try:
+        security_group_id = get_instance_security_group_id(region_id=region, instance_id=instance_id)
+        if not security_group_id:
+            _die(f"Could not determine security group ID for instance {instance_id}")
+        
+        rules = list_security_group_rules(region_id=region, security_group_id=security_group_id)
+        
+        if not rules:
+            typer.echo("No ingress rules found (all ports are closed).")
+            return
+        
+        # Filter and sort by port
+        tcp_rules = [r for r in rules if r.protocol == "tcp"]
+        udp_rules = [r for r in rules if r.protocol == "udp"]
+        other_rules = [r for r in rules if r.protocol not in ("tcp", "udp")]
+        
+        def parse_port(port_range: str) -> int:
+            """Extract port number from port range like '80/80'."""
+            try:
+                parts = port_range.split("/")
+                return int(parts[0]) if parts else 0
+            except (ValueError, IndexError):
+                return 0
+        
+        def format_rule(r) -> str:
+            desc = f" ({r.description})" if r.description else ""
+            return f"{r.port_range:12} {r.protocol.upper():6} {r.source_cidr:18}{desc}"
+        
+        typer.echo(f"Security Group: {security_group_id}")
+        typer.echo(f"{'PORT RANGE':12} {'PROTO':6} {'SOURCE':18} DESCRIPTION")
+        typer.echo("-" * 70)
+        
+        for r in sorted(tcp_rules + udp_rules + other_rules, key=lambda x: (parse_port(x.port_range), x.protocol)):
+            typer.echo(format_rule(r))
+    
+    except EcsError as e:
+        _die(str(e))
+    except Exception as e:
+        _die(f"Aliyun API error: {e}")
+
+
+@port_app.command("open")
+def port_open(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+    port: int = typer.Argument(..., help="Port number to open (e.g., 80, 443, 8080)."),
+    protocol: str = typer.Option("tcp", "--protocol", "-p", help="Protocol: tcp, udp, etc. Default: tcp"),
+    source: str = typer.Option("0.0.0.0/0", "--source", "-s", help="Source CIDR block. Default: 0.0.0.0/0 (all IPs)"),
+    description: str | None = typer.Option(None, "--description", "-d", help="Rule description."),
+) -> None:
+    """Open a port in the security group for a session."""
+    _, state = _load(ctx)
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+    
+    sess = sessions.get(name)
+    if not isinstance(sess, dict):
+        _die(f"Session not found: {name}")
+    
+    region = str(sess.get("region_id") or "")
+    instance_id = str(sess.get("instance_id") or "")
+    if not region or not instance_id:
+        _die(f"Session record missing region_id/instance_id: {name}")
+    
+    if port < 1 or port > 65535:
+        _die(f"Invalid port number: {port}. Must be between 1 and 65535.")
+    
+    protocol_lower = protocol.lower().strip()
+    if protocol_lower not in ("tcp", "udp", "icmp", "gre", "all"):
+        typer.echo(f"Warning: protocol '{protocol}' may not be standard. Common protocols: tcp, udp", err=True)
+    
+    try:
+        security_group_id = get_instance_security_group_id(region_id=region, instance_id=instance_id)
+        if not security_group_id:
+            _die(f"Could not determine security group ID for instance {instance_id}")
+        
+        authorize_security_group_rule(
+            region_id=region,
+            security_group_id=security_group_id,
+            port=port,
+            protocol=protocol_lower,
+            source_cidr=source,
+            description=description,
+        )
+        
+        desc_str = f" ({description})" if description else ""
+        typer.echo(f"OK: Opened port {port}/{protocol_lower} from {source}{desc_str}")
+    
+    except EcsError as e:
+        _die(str(e))
+    except Exception as e:
+        _die(f"Aliyun API error: {e}")
+
+
+@port_app.command("close")
+def port_close(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+    port: int = typer.Argument(..., help="Port number to close (e.g., 80, 443, 8080)."),
+    protocol: str = typer.Option("tcp", "--protocol", "-p", help="Protocol: tcp, udp, etc. Default: tcp"),
+    source: str = typer.Option("0.0.0.0/0", "--source", "-s", help="Source CIDR block. Default: 0.0.0.0/0"),
+) -> None:
+    """Close a port in the security group for a session."""
+    _, state = _load(ctx)
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+    
+    sess = sessions.get(name)
+    if not isinstance(sess, dict):
+        _die(f"Session not found: {name}")
+    
+    region = str(sess.get("region_id") or "")
+    instance_id = str(sess.get("instance_id") or "")
+    if not region or not instance_id:
+        _die(f"Session record missing region_id/instance_id: {name}")
+    
+    if port < 1 or port > 65535:
+        _die(f"Invalid port number: {port}. Must be between 1 and 65535.")
+    
+    protocol_lower = protocol.lower().strip()
+    
+    try:
+        security_group_id = get_instance_security_group_id(region_id=region, instance_id=instance_id)
+        if not security_group_id:
+            _die(f"Could not determine security group ID for instance {instance_id}")
+        
+        revoke_security_group_rule(
+            region_id=region,
+            security_group_id=security_group_id,
+            port=port,
+            protocol=protocol_lower,
+            source_cidr=source,
+        )
+        
+        typer.echo(f"OK: Closed port {port}/{protocol_lower} from {source}")
+    
+    except EcsError as e:
+        _die(str(e))
+    except Exception as e:
+        _die(f"Aliyun API error: {e}")
 
