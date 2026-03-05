@@ -84,6 +84,7 @@ def new_state() -> dict[str, Any]:
         "config": default_config(),
         "templates": {},  # name -> template record
         "sessions": {},  # name -> session record
+        "clusters": {},  # name -> cluster record
     }
 
 
@@ -109,6 +110,11 @@ def normalize_state(raw: Any) -> dict[str, Any]:
     if not isinstance(templates, dict):
         templates = {}
     base["templates"] = templates
+
+    clusters = base.get("clusters")
+    if not isinstance(clusters, dict):
+        clusters = {}
+    base["clusters"] = clusters
 
     if "version" not in base:
         base["version"] = 1

@@ -112,6 +112,33 @@ ecs template create erdma --edit
 ecs template edit erdma
 ```
 
+## Cluster（集群）
+
+Cluster 用一个模板一次创建多个实例，并将它们作为同一个集群管理。
+
+- 创建时指定节点数，实例名固定为：`<clustername>-<rank>`（rank 从 0 开始）
+- Cluster 的节点在本地 state.json 里同样作为普通 session 记录，所以可以直接像普通实例一样操作：
+  - `ecs connect <clustername>-0`
+  - `ecs stop <clustername>-1`
+  - `ecs delete <clustername>-2`
+- `ecs list` 会把同一个 cluster 的节点按 rank 排在一起显示
+
+示例：
+
+```powershell
+# 创建一个 4 节点的集群
+ecs cluster create mycluster -t erdma -n 4
+
+# 列出集群（默认会带节点明细）
+ecs cluster list
+
+# 扩容 2 个节点（会新增 mycluster-4、mycluster-5）
+ecs cluster expand mycluster -n 2
+
+# 删除整个集群（会删除所有节点实例并清理本地记录）
+ecs cluster delete mycluster -y
+```
+
 ## eRDMA（ERI）
 
 如果你的实例规格支持 eRDMA（Elastic RDMA Interface, ERI），可以在创建时开启。开启后 `ecs create` 会在创建实例流程中：

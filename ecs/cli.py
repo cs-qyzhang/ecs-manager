@@ -188,6 +188,12 @@ port_app = typer.Typer(
 )
 app.add_typer(port_app, name="port")
 
+cluster_app = typer.Typer(
+    help="Manage clusters (groups of instances created from a template).",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(cluster_app, name="cluster")
+
 
 _SAFE_TEMPLATE_FILE = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -398,6 +404,35 @@ def _complete_template_names(incomplete: str) -> list[str]:
         if not isinstance(templates, dict):
             return []
         names = sorted(str(k) for k in templates.keys())
+        return [n for n in names if n.startswith(incomplete)]
+    except Exception:
+        return []
+
+
+def _complete_cluster_names(incomplete: str) -> list[str]:
+    try:
+        state_path = default_state_path()
+        try:
+            import shlex
+
+            args_str = os.getenv("_TYPER_COMPLETE_ARGS") or ""
+            if args_str:
+                parts = shlex.split(args_str, posix=False)
+                for i, p in enumerate(parts):
+                    if p.startswith("--state-file="):
+                        state_path = Path(p.split("=", 1)[1]).expanduser()
+                        break
+                    if p == "--state-file" and i + 1 < len(parts):
+                        state_path = Path(parts[i + 1]).expanduser()
+                        break
+        except Exception:
+            pass
+
+        state = load_state(state_path)
+        clusters = state.get("clusters") or {}
+        if not isinstance(clusters, dict):
+            return []
+        names = sorted(str(k) for k in clusters.keys())
         return [n for n in names if n.startswith(incomplete)]
     except Exception:
         return []
@@ -715,16 +750,28 @@ def list_sessions(ctx: typer.Context) -> None:
         typer.echo("(no sessions)")
         return
 
-    rows = []
+    # Keep output stable, but sort cluster nodes together in rank order.
+    rows: list[tuple[str, str, str, str, str | None, int | None]] = []
     for name, s in sessions.items():
         if not isinstance(s, dict):
             continue
+        cluster_name = s.get("cluster_name")
+        if cluster_name is not None and not isinstance(cluster_name, str):
+            cluster_name = str(cluster_name)
+        cluster_rank: int | None = None
+        if s.get("cluster_rank") is not None:
+            try:
+                cluster_rank = int(s.get("cluster_rank"))
+            except Exception:
+                cluster_rank = None
         rows.append(
             (
                 str(name),
                 str(s.get("status") or "-"),
                 str(s.get("public_ip") or "-"),
                 str(s.get("instance_id") or "-"),
+                str(cluster_name).strip() or None,
+                cluster_rank,
             )
         )
 
@@ -736,7 +783,14 @@ def list_sessions(ctx: typer.Context) -> None:
     )
     typer.echo(header)
     typer.echo("-" * len(header))
-    for r in sorted(rows, key=lambda x: x[0]):
+
+    def _sort_key(r: tuple[str, str, str, str, str | None, int | None]) -> tuple[Any, ...]:
+        cname = r[4]
+        if cname:
+            return (0, cname, r[5] if r[5] is not None else 10**9, r[0])
+        return (1, r[0])
+
+    for r in sorted(rows, key=_sort_key):
         typer.echo(f"{r[0].ljust(name_w)}  {r[1].ljust(status_w)}  {r[2].ljust(ip_w)}  {r[3]}")
 
 
@@ -1471,6 +1525,20 @@ def sync(
 
     imported = 0
     if import_new:
+        clusters = state.get("clusters") or {}
+        if not isinstance(clusters, dict):
+            clusters = {}
+        cluster_by_instance_id: dict[str, tuple[str, int, str]] = {}
+        for cname, crec in clusters.items():
+            if not isinstance(crec, dict):
+                continue
+            for rank, node in _cluster_nodes_from_record(crec):
+                instance_id = str(node.get("instance_id") or "").strip()
+                if not instance_id:
+                    continue
+                node_name = str(node.get("name") or _cluster_node_name(str(cname), int(rank)))
+                cluster_by_instance_id[instance_id] = (str(cname), int(rank), node_name)
+
         candidates: list[tuple[str, Any]] = []
         if import_all:
             candidates = list(instances_by_id.values())
@@ -1499,12 +1567,21 @@ def sync(
                 r, info = normalized_regions[0], item
             if not info.instance_id or info.instance_id in existing_ids:
                 continue
-            base = (info.instance_name or "").strip() or info.instance_id
-            new_name = base
-            if new_name in sessions:
-                new_name = f"{base}-{info.instance_id}"
 
-            sessions[new_name] = {
+            cluster_hint = cluster_by_instance_id.get(info.instance_id)
+            if cluster_hint:
+                cname, crank, preferred_name = cluster_hint
+                base = preferred_name.strip() or (info.instance_name or "").strip() or info.instance_id
+                new_name = base
+                if new_name in sessions:
+                    new_name = f"{base}-{info.instance_id}"
+            else:
+                base = (info.instance_name or "").strip() or info.instance_id
+                new_name = base
+                if new_name in sessions:
+                    new_name = f"{base}-{info.instance_id}"
+
+            rec: dict[str, Any] = {
                 "name": new_name,
                 "region_id": r,
                 "instance_id": info.instance_id,
@@ -1520,7 +1597,37 @@ def sync(
                 "last_refresh_at": now_iso_utc(),
                 "imported_at": now_iso_utc(),
             }
+            if cluster_hint:
+                rec["cluster_name"] = cname
+                rec["cluster_rank"] = int(crank)
+
+            sessions[new_name] = rec
             imported += 1
+
+    # Best-effort: ensure sessions carry cluster metadata if cluster records exist.
+    clusters_final = state.get("clusters") or {}
+    if isinstance(clusters_final, dict) and clusters_final:
+        by_id: dict[str, tuple[str, int]] = {}
+        for cname, crec in clusters_final.items():
+            if not isinstance(crec, dict):
+                continue
+            for rank, node in _cluster_nodes_from_record(crec):
+                iid = str(node.get("instance_id") or "").strip()
+                if iid:
+                    by_id[iid] = (str(cname), int(rank))
+        for rec in sessions.values():
+            if not isinstance(rec, dict):
+                continue
+            iid = str(rec.get("instance_id") or "").strip()
+            if not iid:
+                continue
+            hint = by_id.get(iid)
+            if not hint:
+                continue
+            if not rec.get("cluster_name"):
+                rec["cluster_name"] = hint[0]
+            if rec.get("cluster_rank") is None:
+                rec["cluster_rank"] = int(hint[1])
 
     _save(path, state)
 
@@ -1551,6 +1658,32 @@ def rename(
     if isinstance(rec, dict):
         rec["name"] = new
     sessions[new] = rec
+
+    # If this is a cluster node, keep the cluster record in sync.
+    if isinstance(rec, dict):
+        cname = rec.get("cluster_name")
+        crank = rec.get("cluster_rank")
+        if cname:
+            clusters = state.get("clusters") or {}
+            if isinstance(clusters, dict):
+                crec = clusters.get(str(cname))
+                if isinstance(crec, dict):
+                    nodes_map = crec.get("nodes")
+                    if isinstance(nodes_map, dict):
+                        rank_key = None
+                        if crank is not None:
+                            try:
+                                rank_key = str(int(crank))
+                            except Exception:
+                                rank_key = None
+                        if rank_key and rank_key in nodes_map and isinstance(nodes_map.get(rank_key), dict):
+                            nodes_map[rank_key]["name"] = new
+                        else:
+                            for v in nodes_map.values():
+                                if isinstance(v, dict) and str(v.get("name") or "") == old:
+                                    v["name"] = new
+                                    break
+                    crec["updated_at"] = now_iso_utc()
     _save(path, state)
     typer.echo("OK")
 
@@ -1847,9 +1980,47 @@ def delete(
     except Exception:
         pass
 
+    # If this session is part of a cluster, remove it from the cluster record so
+    # `ecs cluster list/delete` stays consistent.
+    clusters = state.get("clusters") or {}
+    if isinstance(clusters, dict):
+        cname = sess.get("cluster_name")
+        if cname is not None and not isinstance(cname, str):
+            cname = str(cname)
+        if cname:
+            crec = clusters.get(cname)
+            if isinstance(crec, dict):
+                nodes_map = crec.get("nodes")
+                if isinstance(nodes_map, dict):
+                    rank_key = None
+                    if sess.get("cluster_rank") is not None:
+                        try:
+                            rank_key = str(int(sess.get("cluster_rank")))
+                        except Exception:
+                            rank_key = None
+                    if rank_key and rank_key in nodes_map:
+                        nodes_map.pop(rank_key, None)
+                    else:
+                        inst_id = str(sess.get("instance_id") or "")
+                        for k in list(nodes_map.keys()):
+                            v = nodes_map.get(k)
+                            if not isinstance(v, dict):
+                                continue
+                            if str(v.get("name") or "") == name or (inst_id and str(v.get("instance_id") or "") == inst_id):
+                                nodes_map.pop(k, None)
+                    if not nodes_map:
+                        clusters.pop(cname, None)
+                    else:
+                        crec["updated_at"] = now_iso_utc()
+
     if not keep_record:
         sessions.pop(name, None)
-        _save(path, state)
+    else:
+        # Instance is gone; clear cluster hints so `ecs list` doesn't group it as a live node.
+        sess.pop("cluster_name", None)
+        sess.pop("cluster_rank", None)
+
+    _save(path, state)
 
     typer.echo("OK")
 
@@ -2251,4 +2422,362 @@ def port_close(
         _die(str(e))
     except Exception as e:
         _die(f"Aliyun API error: {e}")
+
+
+def _ensure_clusters_dict(state: dict[str, Any]) -> dict[str, Any]:
+    clusters = state.get("clusters")
+    if not isinstance(clusters, dict):
+        clusters = {}
+        state["clusters"] = clusters
+    return clusters
+
+
+def _cluster_nodes_from_record(cluster: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    nodes_raw = cluster.get("nodes") or {}
+    if not isinstance(nodes_raw, dict):
+        return []
+
+    out: list[tuple[int, dict[str, Any]]] = []
+    for k, v in nodes_raw.items():
+        try:
+            rank = int(str(k).strip())
+        except Exception:
+            continue
+        if not isinstance(v, dict):
+            continue
+        out.append((rank, v))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _cluster_node_name(cluster_name: str, rank: int) -> str:
+    return f"{cluster_name}-{rank}"
+
+
+@cluster_app.command("create")
+def cluster_create(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Cluster name. Nodes are named <cluster>-<rank>."),
+    template: str = typer.Option(
+        ...,
+        "--template",
+        "-t",
+        autocompletion=_complete_template_names,
+        help="Template name used for all nodes (from `ecs template`).",
+    ),
+    count: int = typer.Option(..., "--count", "-n", help="Number of nodes to create."),
+    start_rank: int = typer.Option(0, "--start-rank", help="Start rank (default: 0)."),
+) -> None:
+    """Create a cluster by creating multiple instances from a template."""
+    if int(count) < 1:
+        _die("--count must be >= 1")
+    if int(start_rank) < 0:
+        _die("--start-rank must be >= 0")
+    path, state = _load(ctx)
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+    if template not in templates:
+        _die(f"Template not found: {template}")
+
+    clusters = _ensure_clusters_dict(state)
+    if name in clusters:
+        _die(f"Cluster already exists: {name}")
+
+    # Prevent accidental overlap with existing records.
+    for i in range(int(count)):
+        r = int(start_rank) + i
+        node = _cluster_node_name(name, r)
+        if node in sessions:
+            _die(f"Session already exists: {node} (cannot create cluster {name})")
+
+    cluster_rec: dict[str, Any] = {
+        "name": name,
+        "template": template,
+        "created_at": now_iso_utc(),
+        "updated_at": now_iso_utc(),
+        "nodes": {},
+    }
+    clusters[name] = cluster_rec
+    _save(path, state)
+
+    created = 0
+    for i in range(int(count)):
+        rank = int(start_rank) + i
+        node_name = _cluster_node_name(name, rank)
+        try:
+            create(ctx, name=node_name, template=template)
+        except typer.Exit:
+            typer.echo(f"Cluster create stopped after {created}/{count} nodes.", err=True)
+            raise
+
+        # Re-load (create() persists state internally).
+        path2, state2 = _load(ctx)
+        sessions2 = state2.get("sessions") or {}
+        if not isinstance(sessions2, dict):
+            _die("State file is corrupted: sessions is not a dict.")
+        sess = sessions2.get(node_name)
+        if not isinstance(sess, dict):
+            _die(f"Created session record missing: {node_name}")
+
+        sess["cluster_name"] = name
+        sess["cluster_rank"] = int(rank)
+
+        clusters2 = _ensure_clusters_dict(state2)
+        crec = clusters2.get(name)
+        if not isinstance(crec, dict):
+            crec = cluster_rec
+            clusters2[name] = crec
+        nodes = crec.get("nodes")
+        if not isinstance(nodes, dict):
+            nodes = {}
+            crec["nodes"] = nodes
+        nodes[str(rank)] = {
+            "name": node_name,
+            "instance_id": str(sess.get("instance_id") or ""),
+            "region_id": str(sess.get("region_id") or ""),
+        }
+        if not crec.get("region_id"):
+            crec["region_id"] = str(sess.get("region_id") or "")
+        crec["updated_at"] = now_iso_utc()
+        _save(path2, state2)
+        created += 1
+
+    typer.echo(f"OK: created cluster {name} with {created} nodes")
+
+
+@cluster_app.command("expand")
+def cluster_expand(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_cluster_names, help="Cluster name."),
+    count: int = typer.Option(..., "--count", "-n", help="Number of nodes to add."),
+    template: str | None = typer.Option(
+        None,
+        "--template",
+        "-t",
+        autocompletion=_complete_template_names,
+        help="Optional template override. Default: cluster's template.",
+    ),
+) -> None:
+    """Expand a cluster by adding more nodes."""
+    if int(count) < 1:
+        _die("--count must be >= 1")
+    path, state = _load(ctx)
+    clusters = _ensure_clusters_dict(state)
+    crec = clusters.get(name)
+    if not isinstance(crec, dict):
+        _die(f"Cluster not found: {name}")
+
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+
+    template_final = str(template or crec.get("template") or "").strip()
+    if not template_final:
+        _die("Cluster record missing template; pass --template.")
+    if template_final not in templates:
+        _die(f"Template not found: {template_final}")
+
+    nodes = _cluster_nodes_from_record(crec)
+    next_rank = (nodes[-1][0] + 1) if nodes else 0
+
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    for i in range(int(count)):
+        node_name = _cluster_node_name(name, next_rank + i)
+        if node_name in sessions:
+            _die(f"Session already exists: {node_name} (cannot expand cluster {name})")
+
+    added = 0
+    for i in range(int(count)):
+        rank = next_rank + i
+        node_name = _cluster_node_name(name, rank)
+        try:
+            create(ctx, name=node_name, template=template_final)
+        except typer.Exit:
+            typer.echo(f"Cluster expand stopped after {added}/{count} new nodes.", err=True)
+            raise
+
+        path2, state2 = _load(ctx)
+        sessions2 = state2.get("sessions") or {}
+        if not isinstance(sessions2, dict):
+            _die("State file is corrupted: sessions is not a dict.")
+        sess = sessions2.get(node_name)
+        if not isinstance(sess, dict):
+            _die(f"Created session record missing: {node_name}")
+
+        sess["cluster_name"] = name
+        sess["cluster_rank"] = int(rank)
+
+        clusters2 = _ensure_clusters_dict(state2)
+        crec2 = clusters2.get(name)
+        if not isinstance(crec2, dict):
+            crec2 = {"name": name, "template": template_final, "created_at": now_iso_utc(), "updated_at": now_iso_utc(), "nodes": {}}
+            clusters2[name] = crec2
+        if not crec2.get("template"):
+            crec2["template"] = template_final
+        nodes2 = crec2.get("nodes")
+        if not isinstance(nodes2, dict):
+            nodes2 = {}
+            crec2["nodes"] = nodes2
+        nodes2[str(rank)] = {
+            "name": node_name,
+            "instance_id": str(sess.get("instance_id") or ""),
+            "region_id": str(sess.get("region_id") or ""),
+        }
+        if not crec2.get("region_id"):
+            crec2["region_id"] = str(sess.get("region_id") or "")
+        crec2["updated_at"] = now_iso_utc()
+        _save(path2, state2)
+        added += 1
+
+    typer.echo(f"OK: expanded cluster {name} by {added} nodes")
+
+
+@cluster_app.command("delete")
+def cluster_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_cluster_names, help="Cluster name."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not prompt for confirmation."),
+    force: bool = typer.Option(True, "--force/--no-force", help="Use Force=True for DeleteInstance."),
+) -> None:
+    """Delete all instances in a cluster and remove local records."""
+    path, state = _load(ctx)
+    clusters = _ensure_clusters_dict(state)
+    crec = clusters.get(name)
+    if not isinstance(crec, dict):
+        _die(f"Cluster not found: {name}")
+
+    nodes = _cluster_nodes_from_record(crec)
+    if not nodes:
+        if not yes:
+            confirmed = typer.confirm(f"Cluster {name} has no recorded nodes. Remove cluster record anyway?")
+            if not confirmed:
+                raise typer.Exit(1)
+        clusters.pop(name, None)
+        _save(path, state)
+        typer.echo("OK")
+        return
+
+    if not yes:
+        confirmed = typer.confirm(f"Delete cluster {name} with {len(nodes)} nodes?")
+        if not confirmed:
+            raise typer.Exit(1)
+
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    failed: list[str] = []
+    deleted: list[str] = []
+
+    for rank, node in nodes:
+        node_name = str(node.get("name") or _cluster_node_name(name, rank))
+        instance_id = str(node.get("instance_id") or "")
+        region_id = str(node.get("region_id") or crec.get("region_id") or "")
+
+        # Prefer session record for region/instance_id if present.
+        sess = sessions.get(node_name)
+        if isinstance(sess, dict):
+            if not instance_id:
+                instance_id = str(sess.get("instance_id") or "")
+            if not region_id:
+                region_id = str(sess.get("region_id") or "")
+
+        if not region_id or not instance_id:
+            failed.append(node_name)
+            typer.echo(f"Warning: missing region_id/instance_id for node {node_name}; skipped.", err=True)
+            continue
+
+        try:
+            delete_instance(region_id=region_id, instance_id=instance_id, force=force)
+            deleted.append(node_name)
+        except Exception as e:
+            failed.append(node_name)
+            typer.echo(f"Warning: failed to delete {node_name} ({instance_id}): {e}", err=True)
+            continue
+
+        try:
+            ssh_config_remove(ssh_config_path(), node_name)
+        except Exception:
+            pass
+
+        sessions.pop(node_name, None)
+        # Remove from cluster nodes map as we go.
+        nodes_map = crec.get("nodes")
+        if isinstance(nodes_map, dict):
+            nodes_map.pop(str(rank), None)
+
+    if not failed:
+        clusters.pop(name, None)
+    crec["updated_at"] = now_iso_utc()
+    _save(path, state)
+
+    if failed:
+        _die(f"Cluster delete incomplete. Deleted: {len(deleted)}, Failed/skipped: {len(failed)}")
+
+    typer.echo("OK")
+
+
+@cluster_app.command("list")
+def cluster_list(
+    ctx: typer.Context,
+    show_nodes: bool = typer.Option(True, "--nodes/--no-nodes", help="Show node details."),
+) -> None:
+    """List clusters from the local state file."""
+    _, state = _load(ctx)
+    clusters = state.get("clusters") or {}
+    if not isinstance(clusters, dict) or not clusters:
+        typer.echo("(no clusters)")
+        return
+
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        sessions = {}
+
+    rows: list[tuple[str, str, int]] = []
+    for cname, crec in clusters.items():
+        if not isinstance(crec, dict):
+            continue
+        template = str(crec.get("template") or "-")
+        nodes = _cluster_nodes_from_record(crec)
+        rows.append((str(cname), template, len(nodes)))
+
+    if not rows:
+        typer.echo("(no clusters)")
+        return
+
+    name_w = max(len(r[0]) for r in rows)
+    tmpl_w = max(len(r[1]) for r in rows)
+    header = f"{'CLUSTER'.ljust(name_w)}  {'TEMPLATE'.ljust(tmpl_w)}  NODES"
+    typer.echo(header)
+    typer.echo("-" * len(header))
+
+    for cname, tmpl, n in sorted(rows, key=lambda x: x[0]):
+        typer.echo(f"{cname.ljust(name_w)}  {tmpl.ljust(tmpl_w)}  {n}")
+        if not show_nodes:
+            continue
+
+        crec = clusters.get(cname)
+        if not isinstance(crec, dict):
+            continue
+        nodes = _cluster_nodes_from_record(crec)
+        for rank, node in nodes:
+            node_name = str(node.get("name") or _cluster_node_name(cname, rank))
+            sess = sessions.get(node_name)
+            status = "-"
+            ip = "-"
+            instance_id = str(node.get("instance_id") or "-")
+            if isinstance(sess, dict):
+                status = str(sess.get("status") or "-")
+                ip = str(sess.get("public_ip") or sess.get("private_ip") or "-")
+                if instance_id == "-" or not instance_id.strip():
+                    instance_id = str(sess.get("instance_id") or "-")
+            typer.echo(f"  {str(rank).rjust(3)}  {node_name}  {status}  {ip}  {instance_id}")
 
