@@ -89,6 +89,49 @@ $env:ECS_STATE_FILE="D:\sync\ecs_state.json"
 ecs create my-session
 ```
 
+## 创建模板（template）
+
+模板用于保存一组 `ecs create` 的默认参数（保存在 state.json 里）。
+
+```powershell
+# 创建模板（命令行写入）
+ecs template create erdma `
+  region_id=cn-hangzhou `
+  image_id=YOUR_IMAGE_ID `
+  instance_type=ecs.g6.large `
+  security_group_id=sg-xxxx `
+  v_switch_id=vsw-xxxx `
+  key_pair_name=YOUR_KEYPAIR_NAME `
+  enable_erdma=true `
+  -d "cpu + erdma"
+
+# 创建后打开编辑器（会生成 templates/<name>.json 并回写 state.json）
+ecs template create erdma --edit
+
+# 编辑已有模板
+ecs template edit erdma
+```
+
+## eRDMA（ERI）
+
+如果你的实例规格支持 eRDMA（Elastic RDMA Interface, ERI），可以在创建时开启。开启后 `ecs create` 会在创建实例流程中：
+
+- 先通过 `DescribeInstanceTypes` 检查该 `instance_type` 是否支持 ERI（不支持会直接报错，不会创建实例）
+- 创建并绑定一张 `NetworkInterfaceTrafficMode=HighPerformance` 的网卡（ERI）
+- 尝试设置 `DeleteOnRelease=true`，确保实例 `ecs delete` 时自动清理 ERI
+
+开启方式：
+
+```powershell
+# 单次创建开启
+ecs create my-session --erdma
+
+# 或设置默认值
+ecs config set enable_erdma=true
+```
+
+注意：这只负责在网络侧创建/绑定 ERI；实例内的 eRDMA 驱动/软件栈需要你在操作系统内自行安装/配置。
+
 ## 公网 IP / 私网 IP
 
 - `ecs` 默认会在实例 Running 后，**尽量保证拿到公网 IPv4**：

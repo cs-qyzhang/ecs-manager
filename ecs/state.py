@@ -35,6 +35,10 @@ def default_config() -> dict[str, Any]:
         "security_group_id": "",
         "v_switch_id": "",
         "key_pair_name": "",
+        # eRDMA (ERI)
+        # If true, `ecs create` will attach an Elastic RDMA Interface (ERI) by creating a
+        # secondary ENI with NetworkInterfaceTrafficMode=HighPerformance.
+        "enable_erdma": False,
         # System disk (optional; leave null to let Aliyun decide defaults)
         # Common categories: cloud_efficiency | cloud_ssd | cloud_essd | cloud_auto
         "system_disk_category": None,

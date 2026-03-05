@@ -8,21 +8,339 @@ from typing import Any
 
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkecs.request.v20140526.CreateInstanceRequest import CreateInstanceRequest
+from aliyunsdkecs.request.v20140526.CreateNetworkInterfaceRequest import CreateNetworkInterfaceRequest
 from aliyunsdkecs.request.v20140526.DeleteInstanceRequest import DeleteInstanceRequest
+from aliyunsdkecs.request.v20140526.DeleteNetworkInterfaceRequest import DeleteNetworkInterfaceRequest
 from aliyunsdkecs.request.v20140526.DescribeInstancesRequest import DescribeInstancesRequest
+from aliyunsdkecs.request.v20140526.DescribeInstanceTypesRequest import DescribeInstanceTypesRequest
 from aliyunsdkecs.request.v20140526.DescribeRegionsRequest import DescribeRegionsRequest
+from aliyunsdkecs.request.v20140526.DescribeSecurityGroupsRequest import DescribeSecurityGroupsRequest
+from aliyunsdkecs.request.v20140526.DescribeVSwitchesRequest import DescribeVSwitchesRequest
 from aliyunsdkecs.request.v20140526.StartInstanceRequest import StartInstanceRequest
 from aliyunsdkecs.request.v20140526.StopInstanceRequest import StopInstanceRequest
 from aliyunsdkecs.request.v20140526.AllocatePublicIpAddressRequest import AllocatePublicIpAddressRequest
+from aliyunsdkecs.request.v20140526.AttachNetworkInterfaceRequest import AttachNetworkInterfaceRequest
 from aliyunsdkecs.request.v20140526.AuthorizeSecurityGroupRequest import AuthorizeSecurityGroupRequest
 from aliyunsdkecs.request.v20140526.RevokeSecurityGroupRequest import RevokeSecurityGroupRequest
 from aliyunsdkecs.request.v20140526.DescribeSecurityGroupAttributeRequest import DescribeSecurityGroupAttributeRequest
+from aliyunsdkecs.request.v20140526.ModifyNetworkInterfaceAttributeRequest import ModifyNetworkInterfaceAttributeRequest
 
 from .util import normalize_region_id
 
 
 class EcsError(RuntimeError):
     pass
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _extract_instance_type_dicts(resp: dict[str, Any]) -> list[dict[str, Any]]:
+    items = (resp.get("InstanceTypes") or {}).get("InstanceType") or []
+    if isinstance(items, dict):
+        items = [items]
+    out: list[dict[str, Any]] = []
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict):
+                out.append(it)
+    return out
+
+
+def assert_instance_type_supports_erdma(*, region_id: str, instance_type: str) -> None:
+    """
+    Raise EcsError if the instance_type does not support eRDMA (ERI).
+    """
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+
+    req = DescribeInstanceTypesRequest()
+    if hasattr(req, "set_InstanceTypess"):
+        req.set_InstanceTypess([instance_type])
+    elif hasattr(req, "set_InstanceTypes"):
+        req.set_InstanceTypes([instance_type])
+    else:
+        raise EcsError("SDK does not support setting InstanceTypes on DescribeInstanceTypesRequest")
+
+    resp = _do_action_json(client, req)
+    items = _extract_instance_type_dicts(resp)
+    if not items:
+        raise EcsError(f"Unknown instance_type: {instance_type}")
+
+    rec = items[0]
+
+    # Prefer explicit ERI quantity if present.
+    eri_quantity = _to_int(rec.get("EriQuantity"))
+    if eri_quantity is not None:
+        if eri_quantity <= 0:
+            raise EcsError(f"Instance type {instance_type} does not support eRDMA (ERI).")
+        return
+
+    # Fallback: some SDK/API variants expose a boolean support flag.
+    for k in ("ErdmaSupport", "ErdmaSupported", "IsErdmaSupported"):
+        v = rec.get(k)
+        if isinstance(v, bool):
+            if not v:
+                raise EcsError(f"Instance type {instance_type} does not support eRDMA (ERI).")
+            return
+        if isinstance(v, str):
+            low = v.strip().lower()
+            if low in {"true", "yes", "supported", "support"}:
+                return
+            if low in {"false", "no", "unsupported", "notsupported", "not_supported"}:
+                raise EcsError(f"Instance type {instance_type} does not support eRDMA (ERI).")
+
+    # Fallback: ask ECS to filter by ERI capability.
+    req2 = DescribeInstanceTypesRequest()
+    if hasattr(req2, "set_MinimumEriQuantity"):
+        req2.set_MinimumEriQuantity(1)
+    else:
+        raise EcsError("Cannot verify eRDMA (ERI) support: SDK does not support MinimumEriQuantity.")
+
+    if hasattr(req2, "set_InstanceTypess"):
+        req2.set_InstanceTypess([instance_type])
+    elif hasattr(req2, "set_InstanceTypes"):
+        req2.set_InstanceTypes([instance_type])
+
+    resp2 = _do_action_json(client, req2)
+    items2 = _extract_instance_type_dicts(resp2)
+    if not items2:
+        raise EcsError(f"Instance type {instance_type} does not support eRDMA (ERI).")
+
+
+def create_erdma_network_interface(
+    *,
+    region_id: str,
+    v_switch_id: str,
+    security_group_id: str,
+    name: str,
+    description: str | None = None,
+    tags: list[dict[str, str]] | None = None,
+) -> str:
+    """
+    Create a HighPerformance ENI (ERI) for eRDMA.
+    """
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+
+    req = CreateNetworkInterfaceRequest()
+    req.set_VSwitchId(v_switch_id)
+    req.set_SecurityGroupId(security_group_id)
+    req.set_NetworkInterfaceName(name)
+    if description:
+        req.set_Description(description)
+    req.set_NetworkInterfaceTrafficMode("HighPerformance")
+    if tags:
+        req.set_Tags(tags)
+
+    resp = _do_action_json(client, req)
+    nid = resp.get("NetworkInterfaceId")
+    if not isinstance(nid, str) or not nid:
+        raise EcsError(f"CreateNetworkInterface response missing NetworkInterfaceId: {resp}")
+    return nid
+
+
+def attach_network_interface(*, region_id: str, instance_id: str, network_interface_id: str) -> None:
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+
+    req = AttachNetworkInterfaceRequest()
+    req.set_InstanceId(instance_id)
+    req.set_NetworkInterfaceId(network_interface_id)
+    _do_action_json(client, req)
+
+
+def set_network_interface_delete_on_release(
+    *, region_id: str, network_interface_id: str, delete_on_release: bool = True
+) -> None:
+    """
+    Best-effort: delete ENI automatically when the instance is released.
+    """
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+
+    req = ModifyNetworkInterfaceAttributeRequest()
+    req.set_NetworkInterfaceId(network_interface_id)
+    req.set_DeleteOnRelease(bool(delete_on_release))
+    _do_action_json(client, req)
+
+
+def delete_network_interface(*, region_id: str, network_interface_id: str) -> None:
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+    req = DeleteNetworkInterfaceRequest()
+    req.set_NetworkInterfaceId(network_interface_id)
+    _do_action_json(client, req)
+
+
+@dataclass(frozen=True)
+class VSwitchInfo:
+    v_switch_id: str
+    vpc_id: str | None
+    zone_id: str | None
+    is_default: bool | None
+    raw: dict[str, Any]
+
+
+def describe_vswitch(*, region_id: str, v_switch_id: str) -> VSwitchInfo | None:
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+    req = DescribeVSwitchesRequest()
+    req.set_VSwitchId(v_switch_id)
+    resp = _do_action_json(client, req)
+    items = (resp.get("VSwitches") or {}).get("VSwitch") or []
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        return None
+    item = items[0]
+    if not isinstance(item, dict):
+        return None
+
+    raw_is_default = item.get("IsDefault")
+    is_default: bool | None = None
+    if isinstance(raw_is_default, bool):
+        is_default = raw_is_default
+    elif isinstance(raw_is_default, str):
+        low = raw_is_default.strip().lower()
+        if low in {"true", "yes"}:
+            is_default = True
+        elif low in {"false", "no"}:
+            is_default = False
+
+    return VSwitchInfo(
+        v_switch_id=str(item.get("VSwitchId") or v_switch_id),
+        vpc_id=item.get("VpcId") if isinstance(item.get("VpcId"), str) else None,
+        zone_id=item.get("ZoneId") if isinstance(item.get("ZoneId"), str) else None,
+        is_default=is_default,
+        raw=item,
+    )
+
+
+@dataclass(frozen=True)
+class SecurityGroupInfo:
+    security_group_id: str
+    security_group_name: str | None
+    vpc_id: str | None
+    is_default: bool
+    raw: dict[str, Any]
+
+
+def _is_default_security_group(raw: dict[str, Any]) -> bool:
+    v = raw.get("IsDefault")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        if v.strip().lower() in {"true", "yes"}:
+            return True
+        if v.strip().lower() in {"false", "no"}:
+            return False
+
+    name = raw.get("SecurityGroupName")
+    if isinstance(name, str) and name.strip().lower() == "default":
+        return True
+    return False
+
+
+def list_security_groups(*, region_id: str, vpc_id: str, page_size: int = 100) -> list[SecurityGroupInfo]:
+    """
+    List security groups in a VPC.
+    """
+    region_id, _ = normalize_region_id(region_id)
+    client = ecs_client(region_id)
+
+    out: list[SecurityGroupInfo] = []
+    page_number = 1
+    while True:
+        req = DescribeSecurityGroupsRequest()
+        req.set_VpcId(vpc_id)
+        req.set_PageSize(int(page_size))
+        req.set_PageNumber(int(page_number))
+        resp = _do_action_json(client, req)
+        items = (resp.get("SecurityGroups") or {}).get("SecurityGroup") or []
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list) or not items:
+            break
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sgid = item.get("SecurityGroupId")
+            if not isinstance(sgid, str) or not sgid:
+                continue
+            out.append(
+                SecurityGroupInfo(
+                    security_group_id=sgid,
+                    security_group_name=item.get("SecurityGroupName")
+                    if isinstance(item.get("SecurityGroupName"), str)
+                    else None,
+                    vpc_id=item.get("VpcId") if isinstance(item.get("VpcId"), str) else None,
+                    is_default=_is_default_security_group(item),
+                    raw=item,
+                )
+            )
+        total = _to_int(resp.get("TotalCount"))
+        if total is not None and len(out) >= total:
+            break
+        page_number += 1
+
+    return out
+
+
+def resolve_security_group_id_from_vswitch(*, region_id: str, v_switch_id: str) -> str:
+    """
+    Best-effort derive security_group_id for `ecs create` from the vSwitch.
+
+    Rules:
+      1) Prefer the default security group in the same VPC.
+      2) If only one security group exists, use it.
+      3) Otherwise, raise EcsError and ask the user to specify security_group_id.
+    """
+    vsw = describe_vswitch(region_id=region_id, v_switch_id=v_switch_id)
+    if not vsw or not vsw.vpc_id:
+        raise EcsError(f"Failed to resolve VPC from v_switch_id: {v_switch_id}")
+
+    sgs = list_security_groups(region_id=region_id, vpc_id=vsw.vpc_id)
+    if not sgs:
+        raise EcsError(f"No security groups found in VPC {vsw.vpc_id} (from v_switch_id {v_switch_id}).")
+
+    defaults = [sg for sg in sgs if sg.is_default]
+    if len(defaults) == 1:
+        return defaults[0].security_group_id
+    if len(defaults) > 1:
+        ids = ", ".join(sorted(sg.security_group_id for sg in defaults))
+        raise EcsError(f"Multiple default security groups found in VPC {vsw.vpc_id}: {ids}")
+
+    if len(sgs) == 1:
+        return sgs[0].security_group_id
+
+    preview = ", ".join(
+        f"{sg.security_group_id}({sg.security_group_name or '-'})" for sg in sorted(sgs, key=lambda x: x.security_group_id)
+    )
+    raise EcsError(
+        "security_group_id is not set and cannot be inferred uniquely. "
+        f"VPC {vsw.vpc_id} has multiple security groups: {preview}"
+    )
 
 
 def _get_credentials() -> tuple[str, str]:

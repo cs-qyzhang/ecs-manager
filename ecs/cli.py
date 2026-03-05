@@ -123,6 +123,7 @@ def _sanitize_stuck_completion_env() -> None:
 _sanitize_stuck_completion_env()
 
 import json
+import re
 import subprocess
 from typing import Any
 
@@ -133,9 +134,15 @@ from .aliyun_ecs import (
     EcsError,
     allocate_public_ip_address,
     authorize_security_group_rule,
+    assert_instance_type_supports_erdma,
+    resolve_security_group_id_from_vswitch,
     create_instance,
+    create_erdma_network_interface,
     delete_instance,
+    delete_network_interface,
     describe_instance,
+    attach_network_interface,
+    set_network_interface_delete_on_release,
     get_instance_security_group_id,
     list_instances,
     list_regions,
@@ -154,19 +161,158 @@ from .util import coerce_value, format_cmd, normalize_region_id, now_iso_utc, nu
 app = typer.Typer(
     help="Manage Codex sessions on Alibaba Cloud ECS (create/connect/rename/delete).",
     no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
 
-config_app = typer.Typer(help="Manage defaults stored in the JSON state file.")
+config_app = typer.Typer(
+    help="Manage defaults stored in the JSON state file.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 app.add_typer(config_app, name="config")
 
-ssh_app = typer.Typer(help="Manage ~/.ssh/config entries for sessions.")
+ssh_app = typer.Typer(
+    help="Manage ~/.ssh/config entries for sessions.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 app.add_typer(ssh_app, name="ssh")
 
-template_app = typer.Typer(help="Manage reusable create templates stored in the state file.")
+template_app = typer.Typer(
+    help="Manage reusable create templates stored in the state file.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 app.add_typer(template_app, name="template")
 
-port_app = typer.Typer(help="Manage security group port rules for instances.")
+port_app = typer.Typer(
+    help="Manage security group port rules for instances.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 app.add_typer(port_app, name="port")
+
+
+_SAFE_TEMPLATE_FILE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _templates_dir_for_state_file(state_path: Path) -> Path:
+    # Keep templates alongside the state file for easy syncing/backups.
+    # Example: ~/.ecs/state.json -> ~/.ecs/templates/<name>.json
+    return state_path.parent / "templates"
+
+
+def _template_file_path(state_path: Path, name: str) -> Path:
+    safe = _SAFE_TEMPLATE_FILE.sub("_", (name or "").strip())
+    if not safe:
+        safe = "template"
+    return _templates_dir_for_state_file(state_path) / f"{safe}.json"
+
+
+def _parse_editor_cmd() -> list[str] | None:
+    raw = (os.getenv("VISUAL") or os.getenv("EDITOR") or "").strip()
+    if not raw:
+        return None
+    try:
+        import shlex
+
+        parts = shlex.split(raw, posix=(os.name != "nt"))
+        return [p for p in parts if p.strip()]
+    except Exception:
+        return None
+
+
+def _open_in_editor(path: Path) -> None:
+    cmd = _parse_editor_cmd()
+    if cmd:
+        try:
+            subprocess.check_call([*cmd, str(path)])
+            return
+        except FileNotFoundError:
+            _die(f"Editor not found: {cmd[0]!r}. Set VISUAL or EDITOR to a valid command.")
+        except subprocess.CalledProcessError as e:
+            _die(f"Editor exited with code {e.returncode}: {format_cmd(cmd)}")
+
+    # Fallbacks
+    if os.name == "nt":
+        try:
+            subprocess.check_call(["notepad", str(path)])
+        except subprocess.CalledProcessError as e:
+            _die(f"Editor exited with code {e.returncode}: notepad")
+        return
+
+    if sys.platform == "darwin":
+        try:
+            subprocess.check_call(["open", "-W", str(path)])
+        except subprocess.CalledProcessError as e:
+            _die(f"Editor exited with code {e.returncode}: open")
+        return
+
+    # Linux/other: best-effort common editors
+    for fallback in ("nano", "vi"):
+        try:
+            subprocess.check_call([fallback, str(path)])
+            return
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError as e:
+            _die(f"Editor exited with code {e.returncode}: {fallback}")
+    _die("No editor found. Set VISUAL or EDITOR.")
+
+
+def _write_template_file(path: Path, *, name: str, description: str, config: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"name": name, "description": description, "config": config}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _read_template_file(path: Path) -> tuple[str, dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        _die(f"Template file not found: {path}")
+    except json.JSONDecodeError as e:
+        _die(f"Template file is not valid JSON: {path}\n{e}")
+
+    if not isinstance(raw, dict):
+        _die(f"Template file must be a JSON object: {path}")
+
+    desc = raw.get("description") or ""
+    if not isinstance(desc, str):
+        _die(f"Template file field 'description' must be a string: {path}")
+
+    cfg = raw.get("config")
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        _die(f"Template file field 'config' must be an object: {path}")
+
+    return desc, cfg
+
+
+def _template_starter_config() -> dict[str, Any]:
+    # A small, practical starter set for `ecs create`.
+    # Required fields are left empty so users must fill them in.
+    return {
+        "region_id": "",
+        "image_id": "",
+        "instance_type": "",
+        "v_switch_id": "",
+        "key_pair_name": "qyzhang-PDSL",
+        # eRDMA (ERI)
+        "enable_erdma": False,
+        # Public IP behavior
+        "auto_allocate_public_ip": True,
+        "internet_charge_type": "PayByTraffic",
+        "internet_max_bandwidth_out": 10,
+        # System disk (optional)
+        "system_disk_category": "cloud_essd",
+        "system_disk_size": 40,
+        "system_disk_performance_level": "PL0",
+        # Spot (optional)
+        "spot_strategy": "SpotAsPriceGo",
+        "spot_price_limit": None,
+        "spot_duration": None,
+        "spot_interruption_behavior": None,
+        # Convenience
+        "ssh_user": "root",
+    }
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -320,6 +466,43 @@ def template_show(
     typer.echo(json.dumps(rec, ensure_ascii=False, indent=2))
 
 
+@template_app.command("edit")
+def template_edit(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_template_names, help="Template name."),
+) -> None:
+    """Edit a template in $VISUAL/$EDITOR (or a platform fallback) and save back to state.json."""
+    path, state = _load(ctx)
+    templates = state.get("templates") or {}
+    if not isinstance(templates, dict):
+        _die("State file is corrupted: templates is not a dict.")
+
+    rec = templates.get(name)
+    if not isinstance(rec, dict):
+        _die(f"Template not found: {name}")
+
+    cfg = rec.get("config")
+    if not isinstance(cfg, dict):
+        cfg = {}
+        rec["config"] = cfg
+
+    desc = rec.get("description") or ""
+    if not isinstance(desc, str):
+        desc = str(desc)
+
+    tpath = _template_file_path(path, name)
+    _write_template_file(tpath, name=name, description=desc, config=cfg)
+    typer.echo(f"Opening editor: {tpath}")
+    _open_in_editor(tpath)
+
+    new_desc, new_cfg = _read_template_file(tpath)
+    rec["description"] = new_desc
+    rec["config"] = new_cfg
+    rec["updated_at"] = now_iso_utc()
+    _save(path, state)
+    typer.echo("OK")
+
+
 @template_app.command("set")
 def template_set(
     ctx: typer.Context,
@@ -364,6 +547,70 @@ def template_set(
     typer.echo("OK")
 
 
+@template_app.command("create")
+def template_create(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Template name."),
+    pairs: list[str] | None = typer.Argument(
+        None,
+        help="Optional key=value pairs for create defaults. If omitted, use --edit to fill in via editor.",
+    ),
+    description: str | None = typer.Option(None, "--description", "-d", help="Optional description."),
+    edit: bool = typer.Option(False, "--edit", help="Open the template file in an editor after creating."),
+) -> None:
+    """Create a new template (fails if it already exists)."""
+    path, state = _load(ctx)
+    templates = state.get("templates")
+    if not isinstance(templates, dict):
+        templates = {}
+        state["templates"] = templates
+
+    if name in templates:
+        _die(f"Template already exists: {name} (use `ecs template set` or `ecs template edit`)")
+
+    cfg: dict[str, Any] = {}
+    for raw in (pairs or []):
+        if "=" not in raw:
+            _die(f"Invalid pair (expected key=value): {raw}")
+        k, v = raw.split("=", 1)
+        k = k.strip()
+        if not k:
+            _die(f"Invalid key in pair: {raw}")
+        cfg[k] = coerce_value(v)
+
+    if not cfg and not edit:
+        _die("No key=value pairs provided. Use `ecs template create <name> k=v ...` or add --edit.")
+
+    # When creating with --edit, provide a starter skeleton so users have a clear list of common keys.
+    file_cfg: dict[str, Any] = dict(cfg)
+    if edit:
+        for k, v in _template_starter_config().items():
+            file_cfg.setdefault(k, v)
+
+    rec = {
+        "name": name,
+        "created_at": now_iso_utc(),
+        "updated_at": now_iso_utc(),
+        "description": str(description or ""),
+        "config": cfg,
+    }
+    templates[name] = rec
+    _save(path, state)
+
+    if edit:
+        tpath = _template_file_path(path, name)
+        _write_template_file(tpath, name=name, description=str(rec["description"]), config=file_cfg)
+        typer.echo(f"Opening editor: {tpath}")
+        _open_in_editor(tpath)
+        new_desc, new_cfg = _read_template_file(tpath)
+        rec["description"] = new_desc
+        rec["config"] = new_cfg
+        rec["updated_at"] = now_iso_utc()
+        _save(path, state)
+
+    typer.echo("OK")
+
+
 @template_app.command("unset")
 def template_unset(
     ctx: typer.Context,
@@ -403,6 +650,11 @@ def template_delete(
         _die(f"Template not found: {name}")
     templates.pop(name, None)
     _save(path, state)
+    # Best-effort cleanup of the exported template file (if it exists).
+    try:
+        _template_file_path(path, name).unlink(missing_ok=True)
+    except Exception:
+        pass
     typer.echo("OK")
 
 
@@ -548,6 +800,11 @@ def create(
         "--allocate-public-ip/--no-allocate-public-ip",
         help="If enabled and no public IP is assigned, ecs will call AllocatePublicIpAddress. Default from config auto_allocate_public_ip.",
     ),
+    erdma: bool | None = typer.Option(
+        None,
+        "--erdma/--no-erdma",
+        help="Enable eRDMA by attaching an Elastic RDMA Interface (ERI). Default from config enable_erdma.",
+    ),
     internet_max_bandwidth_out: int | None = typer.Option(None, "--internet-max-bandwidth-out"),
     internet_charge_type: str | None = typer.Option(None, "--internet-charge-type"),
     spot_strategy: str | None = typer.Option(
@@ -606,7 +863,6 @@ def create(
     region = region_id or effective_cfg.get("region_id") or ""
     image = image_id or effective_cfg.get("image_id") or ""
     itype = instance_type or effective_cfg.get("instance_type") or ""
-    sg = security_group_id or effective_cfg.get("security_group_id") or ""
     vsw = v_switch_id or effective_cfg.get("v_switch_id") or ""
     keypair = key_pair_name or effective_cfg.get("key_pair_name") or ""
 
@@ -621,9 +877,27 @@ def create(
         region = normalized_region
     image = _require(str(image), "image_id")
     itype = _require(str(itype), "instance_type")
-    sg = _require(str(sg), "security_group_id")
     vsw = _require(str(vsw), "v_switch_id")
     keypair = _require(str(keypair), "key_pair_name")
+
+    sg = security_group_id or effective_cfg.get("security_group_id") or ""
+    sg = str(sg).strip()
+    if not sg:
+        try:
+            sg = resolve_security_group_id_from_vswitch(region_id=region, v_switch_id=vsw)
+            typer.echo(f"Info: security_group_id auto-selected from v_switch_id: {sg}")
+        except EcsError as e:
+            _die(
+                "Missing required config: security_group_id. Set it via: "
+                "ecs config set security_group_id=... \n"
+                f"Auto-detect failed: {e}"
+            )
+        except Exception as e:
+            _die(
+                "Missing required config: security_group_id. Set it via: "
+                "ecs config set security_group_id=... \n"
+                f"Aliyun API error while auto-detecting: {e}"
+            )
 
     bw = (
         internet_max_bandwidth_out
@@ -636,6 +910,7 @@ def create(
         if allocate_public_ip is not None
         else bool(effective_cfg.get("auto_allocate_public_ip", True))
     )
+    erdma_final = bool(erdma) if erdma is not None else bool(effective_cfg.get("enable_erdma", False))
 
     sys_disk_cat = (
         system_disk_category if system_disk_category is not None else effective_cfg.get("system_disk_category")
@@ -686,6 +961,14 @@ def create(
             typer.echo(
                 f"Info: hostname set to {hostname_final!r} (sanitized from session name {name!r})",
             )
+
+    if erdma_final:
+        try:
+            assert_instance_type_supports_erdma(region_id=region, instance_type=itype)
+        except EcsError as e:
+            _die(str(e))
+        except Exception as e:
+            _die(f"Aliyun API error: {e}")
 
     def _try_create_with_disk_category(cat: str | None) -> str:
         return create_instance(
@@ -754,6 +1037,27 @@ def create(
     except Exception as e:
         _die(f"Aliyun API error: {e}")
 
+    erdma_network_interface_id: str | None = None
+    erdma_attached = False
+
+    if erdma_final:
+        typer.echo("eRDMA enabled; creating ERI network interface...")
+        try:
+            erdma_network_interface_id = create_erdma_network_interface(
+                region_id=region,
+                v_switch_id=vsw,
+                security_group_id=sg,
+                name=f"erdma-{name}",
+                description=f"ERI for ecs session {name}",
+                tags=[
+                    {"Key": "ecs", "Value": "true"},
+                    {"Key": "ecs_session", "Value": name},
+                    {"Key": "ecs_erdma", "Value": "true"},
+                ],
+            )
+        except Exception as e:
+            _die(f"Failed to create ERI network interface for eRDMA: {e}")
+
     record: dict[str, Any] = {
         "name": name,
         "template": template_name,
@@ -767,6 +1071,9 @@ def create(
         "system_disk_category": sys_disk_cat,
         "system_disk_size": int(sys_disk_size) if sys_disk_size is not None else None,
         "system_disk_performance_level": sys_disk_pl,
+        "erdma_enabled": erdma_final,
+        "erdma_network_interface_id": erdma_network_interface_id,
+        "erdma_attached": False,
         "created_at": now_iso_utc(),
         "status": "Created",
         "public_ip": None,
@@ -778,17 +1085,62 @@ def create(
     sessions[name] = record
     _save(path, state)
 
+    if erdma_final and erdma_network_interface_id:
+        try:
+            attach_network_interface(
+                region_id=region,
+                instance_id=instance_id,
+                network_interface_id=erdma_network_interface_id,
+            )
+            try:
+                set_network_interface_delete_on_release(
+                    region_id=region,
+                    network_interface_id=erdma_network_interface_id,
+                    delete_on_release=True,
+                )
+            except Exception as e:
+                typer.echo(f"Warning: failed to set DeleteOnRelease for ERI: {e}", err=True)
+            record["erdma_attached"] = True
+            _save(path, state)
+            erdma_attached = True
+        except ServerException as e:
+            code = e.get_error_code() if hasattr(e, "get_error_code") else None
+            # Some regions may require the instance to be Running before attaching.
+            if code != "IncorrectInstanceStatus":
+                # Best-effort cleanup for detached ENI.
+                try:
+                    delete_network_interface(region_id=region, network_interface_id=erdma_network_interface_id)
+                except Exception:
+                    pass
+                _die(f"Failed to attach ERI network interface for eRDMA: {e}")
+        except Exception as e:
+            try:
+                delete_network_interface(region_id=region, network_interface_id=erdma_network_interface_id)
+            except Exception:
+                pass
+            _die(f"Failed to attach ERI network interface for eRDMA: {e}")
+
     try:
         start_instance(region_id=region, instance_id=instance_id)
     except EcsError as e:
         record["status"] = "StartFailed"
         record["last_error"] = str(e)
         _save(path, state)
+        if erdma_network_interface_id and not erdma_attached:
+            try:
+                delete_network_interface(region_id=region, network_interface_id=erdma_network_interface_id)
+            except Exception:
+                pass
         _die(str(e))
     except Exception as e:
         record["status"] = "StartFailed"
         record["last_error"] = str(e)
         _save(path, state)
+        if erdma_network_interface_id and not erdma_attached:
+            try:
+                delete_network_interface(region_id=region, network_interface_id=erdma_network_interface_id)
+            except Exception:
+                pass
         _die(f"Aliyun API error: {e}")
 
     record["status"] = "Starting"
@@ -809,6 +1161,29 @@ def create(
         record["private_ip"] = info_obj.private_ip
         record["last_refresh_at"] = now_iso_utc()
         _save(path, state)
+
+        if erdma_final and erdma_network_interface_id and not record.get("erdma_attached"):
+            typer.echo("Attaching ERI network interface for eRDMA (instance is Running)...")
+            try:
+                attach_network_interface(
+                    region_id=region,
+                    instance_id=instance_id,
+                    network_interface_id=erdma_network_interface_id,
+                )
+                try:
+                    set_network_interface_delete_on_release(
+                        region_id=region,
+                        network_interface_id=erdma_network_interface_id,
+                        delete_on_release=True,
+                    )
+                except Exception as e:
+                    typer.echo(f"Warning: failed to set DeleteOnRelease for ERI: {e}", err=True)
+                record["erdma_attached"] = True
+                _save(path, state)
+            except Exception as e:
+                record["last_error"] = f"eRDMA attach failed: {e}"
+                _save(path, state)
+                _die(f"eRDMA requested but failed to attach ERI: {e}")
 
         if allocate_public_ip_final and not record.get("public_ip"):
             bw_int = int(bw or 0)
