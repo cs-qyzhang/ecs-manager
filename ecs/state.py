@@ -67,6 +67,9 @@ def default_config() -> dict[str, Any]:
         # SSH config integration (~/.ssh/config)
         "auto_ssh_config": True,
         "ssh_config_host_prefix": "ecs-",
+        # Template sidecar files used by `ecs template edit` / `ecs template create --edit`.
+        # Empty means: keep using a `.ecs-templates/` directory next to the state file.
+        "template_dir": "",
         # Polling / timeouts
         "timeout_seconds": 600,
         "poll_interval_seconds": 5,

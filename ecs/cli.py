@@ -209,17 +209,29 @@ app.add_typer(cluster_app, name="cluster")
 _SAFE_TEMPLATE_FILE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
-def _templates_dir_for_state_file(state_path: Path) -> Path:
-    # Keep templates alongside the state file for easy syncing/backups.
-    # Example: ~/.ecs/state.json -> ~/.ecs/templates/<name>.json
-    return state_path.parent / "templates"
+def _templates_dir_for_state_file(state_path: Path, config: dict[str, Any] | None = None) -> Path:
+    # Keep templates alongside the state file for easy syncing/backups by default.
+    # Example: ~/.ecs/state.json -> ~/.ecs/.ecs-templates/<name>.json
+    # If config.template_dir is set, use that path instead. Relative paths are
+    # resolved relative to the state file directory.
+    template_dir = ""
+    if isinstance(config, dict):
+        raw = config.get("template_dir")
+        if raw is not None:
+            template_dir = str(raw).strip()
+    if template_dir:
+        candidate = Path(template_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = state_path.parent / candidate
+        return candidate
+    return state_path.parent / ".ecs-templates"
 
 
-def _template_file_path(state_path: Path, name: str) -> Path:
+def _template_file_path(state_path: Path, name: str, config: dict[str, Any] | None = None) -> Path:
     safe = _SAFE_TEMPLATE_FILE.sub("_", (name or "").strip())
     if not safe:
         safe = "template"
-    return _templates_dir_for_state_file(state_path) / f"{safe}.json"
+    return _templates_dir_for_state_file(state_path, config) / f"{safe}.json"
 
 
 def _parse_editor_cmd() -> list[str] | None:
@@ -536,7 +548,8 @@ def template_edit(
     if not isinstance(desc, str):
         desc = str(desc)
 
-    tpath = _template_file_path(path, name)
+    cfg_root = state.get("config") if isinstance(state.get("config"), dict) else None
+    tpath = _template_file_path(path, name, cfg_root)
     _write_template_file(tpath, name=name, description=desc, config=cfg)
     typer.echo(f"Opening editor: {tpath}")
     _open_in_editor(tpath)
@@ -644,7 +657,8 @@ def template_create(
     _save(path, state)
 
     if edit:
-        tpath = _template_file_path(path, name)
+        cfg_root = state.get("config") if isinstance(state.get("config"), dict) else None
+        tpath = _template_file_path(path, name, cfg_root)
         _write_template_file(tpath, name=name, description=str(rec["description"]), config=file_cfg)
         typer.echo(f"Opening editor: {tpath}")
         _open_in_editor(tpath)
@@ -698,7 +712,8 @@ def template_delete(
     _save(path, state)
     # Best-effort cleanup of the exported template file (if it exists).
     try:
-        _template_file_path(path, name).unlink(missing_ok=True)
+        cfg_root = state.get("config") if isinstance(state.get("config"), dict) else None
+        _template_file_path(path, name, cfg_root).unlink(missing_ok=True)
     except Exception:
         pass
     typer.echo("OK")
