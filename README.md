@@ -101,6 +101,7 @@ ecs template create erdma `
   instance_type=ecs.g6.large `
   security_group_id=sg-xxxx `
   v_switch_id=vsw-xxxx `
+  erdma_v_switch_id=vsw-yyyy `
   key_pair_name=YOUR_KEYPAIR_NAME `
   enable_erdma=true `
   -d "cpu + erdma"
@@ -110,6 +111,11 @@ ecs template create erdma --edit
 
 # 编辑已有模板
 ecs template edit erdma
+
+# 如果镜像里没有预装 eRDMA 驱动/软件栈，
+# 默认情况下，enable_erdma=true 会在首次启动时自动执行阿里云官方 eRDMA 一键安装脚本（适合 Linux 镜像）
+# 如需关闭，可加：auto_install_erdma_driver=false
+# 如需完全自定义，可自行提供 user_data；一旦提供，则内置自动安装逻辑会跳过
 ```
 
 ## Cluster（集群）
@@ -158,6 +164,17 @@ ecs config set enable_erdma=true
 ```
 
 注意：这只负责在网络侧创建/绑定 ERI；实例内的 eRDMA 驱动/软件栈需要你在操作系统内自行安装/配置。
+
+默认情况下，开启 eRDMA 时会在首次启动时通过 ECS `CreateInstance` 的 `UserData`
+自动执行阿里云官方 eRDMA 一键安装脚本，效果接近控制台勾选“安装 eRDMA 驱动”。
+
+当前实现会为 eRDMA 额外创建并绑定一张 ERI 网卡。
+如果你希望 ERI 使用不同网段，可设置 `erdma_v_switch_id`，让 ERI 从另一条 vSwitch 分配 IP；
+如果不设置，则默认复用实例主网卡的 `v_switch_id`。
+
+如果你不想自动安装，可设置 `auto_install_erdma_driver=false`。
+如果你自己提供了 `user_data`，则优先使用你的 `user_data`，不会再注入内置安装脚本。
+这里的 `user_data` 填写脚本明文即可，CLI 会在调用 ECS OpenAPI 前自动做 Base64 编码。
 
 ## 公网 IP / 私网 IP
 

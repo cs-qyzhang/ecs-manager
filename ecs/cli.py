@@ -129,8 +129,10 @@ def _sanitize_stuck_completion_env() -> None:
 _sanitize_stuck_completion_env()
 
 import json
+import fnmatch
 import re
 import subprocess
+import textwrap
 from typing import Any
 
 import typer
@@ -315,6 +317,30 @@ def _read_template_file(path: Path) -> tuple[str, dict[str, Any]]:
     return desc, cfg
 
 
+def _default_erdma_driver_user_data() -> str:
+    return textwrap.dedent(
+        """\
+        #!/bin/bash
+        set -euxo pipefail
+        exec > >(tee -a /var/log/erdma-install.log) 2>&1
+
+        INSTALLER_URL="http://mirrors.cloud.aliyuncs.com/erdma/env_setup.sh"
+        INSTALLER_PATH="/root/env_setup.sh"
+
+        if command -v curl >/dev/null 2>&1; then
+          curl -fsSL -o "$INSTALLER_PATH" "$INSTALLER_URL"
+        elif command -v wget >/dev/null 2>&1; then
+          wget -O "$INSTALLER_PATH" "$INSTALLER_URL"
+        else
+          echo "Neither curl nor wget is installed; cannot download eRDMA installer."
+          exit 1
+        fi
+
+        /bin/bash "$INSTALLER_PATH"
+        """
+    )
+
+
 def _template_starter_config() -> dict[str, Any]:
     # A small, practical starter set for `ecs create`.
     # Required fields are left empty so users must fill them in.
@@ -326,6 +352,10 @@ def _template_starter_config() -> dict[str, Any]:
         "key_pair_name": "qyzhang-PDSL",
         # eRDMA (ERI)
         "enable_erdma": False,
+        "erdma_v_switch_id": "",
+        "auto_install_erdma_driver": True,
+        # Optional startup script / cloud-init passed to CreateInstance.
+        "user_data": "",
         # Public IP behavior
         "auto_allocate_public_ip": True,
         "internet_charge_type": "PayByTraffic",
@@ -430,6 +460,175 @@ def _complete_template_names(incomplete: str) -> list[str]:
         return [n for n in names if n.startswith(incomplete)]
     except Exception:
         return []
+
+
+def _session_name_matches_pattern(name: str, pattern: str) -> bool:
+    return fnmatch.fnmatchcase(name, pattern)
+
+
+def _resolve_session_targets(sessions: dict[str, Any], pattern: str) -> list[str]:
+    target = str(pattern or "").strip()
+    if not target:
+        _die("Missing session name or pattern.")
+
+    names = sorted(str(k) for k in sessions.keys())
+    if any(ch in target for ch in "*?["):
+        matched = [name for name in names if _session_name_matches_pattern(name, target)]
+        if not matched:
+            _die(f"No sessions match pattern: {target}")
+        return matched
+
+    if target not in sessions:
+        _die(f"Session not found: {target}")
+    return [target]
+
+
+def _stop_one_session(
+    *,
+    path: Path,
+    state: dict[str, Any],
+    name: str,
+    force: bool,
+    mode: str,
+    wait: bool,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+) -> None:
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    sess = sessions.get(name)
+    if not isinstance(sess, dict):
+        _die(f"Session not found: {name}")
+
+    region = str(sess.get("region_id") or "")
+    instance_id = str(sess.get("instance_id") or "")
+    if not region or not instance_id:
+        _die(f"Session record missing region_id/instance_id: {name}")
+
+    mode_norm = (mode or "").strip().lower()
+    if mode_norm in {"stop-charging", "stopcharging", "stop_charging"}:
+        stopped_mode = "StopCharging"
+    elif mode_norm in {"keep-charging", "keepcharging", "keep_charging"}:
+        stopped_mode = "KeepCharging"
+    else:
+        _die("Invalid --mode. Use: stop-charging or keep-charging.")
+
+    try:
+        stop_instance(region_id=region, instance_id=instance_id, force=force, stopped_mode=stopped_mode)
+    except Exception as e:
+        if stopped_mode == "StopCharging":
+            typer.echo(
+                f"Stop failed with mode StopCharging: {e}\n"
+                f"Tip: try `ecs stop {name} --mode keep-charging`.",
+                err=True,
+            )
+        _die(f"Aliyun API error: {e}")
+
+    sess["status"] = "Stopping"
+    sess["last_refresh_at"] = now_iso_utc()
+    _save(path, state)
+    typer.echo(f"Stopping: {name} ({instance_id}) ...")
+
+    if wait:
+        try:
+            info = wait_instance_status(
+                region_id=region,
+                instance_id=instance_id,
+                desired_status="Stopped",
+                timeout_seconds=int(timeout_seconds),
+                poll_interval_seconds=int(poll_interval_seconds),
+            )
+            sess["status"] = info.status
+            sess["public_ip"] = info.public_ip
+            sess["private_ip"] = info.private_ip
+            sess["last_refresh_at"] = now_iso_utc()
+            _save(path, state)
+            typer.echo(f"OK (Stopped): {name}")
+        except TimeoutError as e:
+            typer.echo(str(e), err=True)
+            typer.echo(f"Tip: run `ecs sync` or `ecs info {name}` later.")
+
+
+def _start_one_session(
+    *,
+    path: Path,
+    state: dict[str, Any],
+    name: str,
+    wait: bool,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    allocate_public_ip: bool | None,
+) -> None:
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    sess = sessions.get(name)
+    if not isinstance(sess, dict):
+        _die(f"Session not found: {name}")
+
+    cfg = state.get("config") or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    region = str(sess.get("region_id") or "")
+    instance_id = str(sess.get("instance_id") or "")
+    if not region or not instance_id:
+        _die(f"Session record missing region_id/instance_id: {name}")
+
+    allocate_public_ip_final = (
+        bool(allocate_public_ip)
+        if allocate_public_ip is not None
+        else bool(cfg.get("auto_allocate_public_ip", True))
+    )
+
+    try:
+        start_instance(region_id=region, instance_id=instance_id)
+    except Exception as e:
+        _die(f"Aliyun API error: {e}")
+
+    sess["status"] = "Starting"
+    sess["last_refresh_at"] = now_iso_utc()
+    _save(path, state)
+    typer.echo(f"Starting: {name} ({instance_id}) ...")
+
+    if wait:
+        try:
+            info = wait_instance_status(
+                region_id=region,
+                instance_id=instance_id,
+                desired_status="Running",
+                timeout_seconds=int(timeout_seconds),
+                poll_interval_seconds=int(poll_interval_seconds),
+            )
+            sess["status"] = info.status
+            sess["public_ip"] = info.public_ip
+            sess["private_ip"] = info.private_ip
+            sess["last_refresh_at"] = now_iso_utc()
+            _save(path, state)
+
+            if allocate_public_ip_final and not sess.get("public_ip"):
+                bw = int(cfg.get("internet_max_bandwidth_out") or 0)
+                if bw > 0:
+                    try:
+                        typer.echo("No public IP yet; allocating public IP via AllocatePublicIpAddress...")
+                        ip = allocate_public_ip_address(region_id=region, instance_id=instance_id)
+                        sess["public_ip"] = ip
+                        sess["last_refresh_at"] = now_iso_utc()
+                        _save(path, state)
+                    except Exception as e:
+                        typer.echo(
+                            f"Warning: failed to allocate public IP: {e}\n"
+                            f"Tip: you can still use `ecs connect {name} --private`, or bind an EIP.",
+                            err=True,
+                        )
+
+            typer.echo(f"OK (Running): {name}")
+        except TimeoutError as e:
+            typer.echo(str(e), err=True)
+            typer.echo(f"Tip: run `ecs sync` or `ecs info {name}` later.")
 
 
 def _complete_cluster_names(incomplete: str) -> list[str]:
@@ -1019,6 +1218,7 @@ def create(
     image = image_id or effective_cfg.get("image_id") or ""
     itype = instance_type or effective_cfg.get("instance_type") or ""
     vsw = v_switch_id or effective_cfg.get("v_switch_id") or ""
+    erdma_vsw = effective_cfg.get("erdma_v_switch_id") or ""
     keypair = key_pair_name or effective_cfg.get("key_pair_name") or ""
 
     region = _require(str(region), "region_id")
@@ -1033,6 +1233,7 @@ def create(
     image = _require(str(image), "image_id")
     itype = _require(str(itype), "instance_type")
     vsw = _require(str(vsw), "v_switch_id")
+    erdma_vsw = str(erdma_vsw).strip() or vsw
     keypair = _require(str(keypair), "key_pair_name")
 
     sg = security_group_id or effective_cfg.get("security_group_id") or ""
@@ -1066,6 +1267,7 @@ def create(
         else bool(effective_cfg.get("auto_allocate_public_ip", True))
     )
     erdma_final = bool(erdma) if erdma is not None else bool(effective_cfg.get("enable_erdma", False))
+    erdma_auto_install_final = bool(effective_cfg.get("auto_install_erdma_driver", True))
 
     sys_disk_cat = (
         system_disk_category if system_disk_category is not None else effective_cfg.get("system_disk_category")
@@ -1093,6 +1295,9 @@ def create(
     )
 
     ssh_user_final = ssh_user or effective_cfg.get("ssh_user") or "root"
+    user_data_final = effective_cfg.get("user_data")
+    if user_data_final is not None:
+        user_data_final = str(user_data_final)
     timeout_final = int(timeout_seconds or effective_cfg.get("timeout_seconds") or 600)
     poll_final = int(poll_interval_seconds or effective_cfg.get("poll_interval_seconds") or 5)
 
@@ -1125,6 +1330,24 @@ def create(
         except Exception as e:
             _die(f"Aliyun API error: {e}")
 
+        if user_data_final and user_data_final.strip():
+            typer.echo(
+                "eRDMA enabled; custom user_data detected, so built-in driver auto-install is skipped.",
+                err=True,
+            )
+        elif erdma_auto_install_final:
+            user_data_final = _default_erdma_driver_user_data()
+            typer.echo(
+                "eRDMA enabled; guest driver/software stack will be auto-installed on first boot (Linux images).",
+                err=True,
+            )
+        else:
+            typer.echo(
+                "Note: eRDMA will configure the ERI network interface only; "
+                "guest driver auto-install is disabled by config.",
+                err=True,
+            )
+
     def _try_create_with_disk_category(cat: str | None) -> str:
         return create_instance(
             region_id=region,
@@ -1150,6 +1373,7 @@ def create(
             spot_interruption_behavior=str(spot_interruption_behavior_final)
             if spot_interruption_behavior_final
             else None,
+            user_data=user_data_final,
         )
 
     try:
@@ -1200,7 +1424,7 @@ def create(
         try:
             erdma_network_interface_id = create_erdma_network_interface(
                 region_id=region,
-                v_switch_id=vsw,
+                v_switch_id=erdma_vsw,
                 security_group_id=sg,
                 name=f"erdma-{name}",
                 description=f"ERI for ecs session {name}",
@@ -1227,6 +1451,7 @@ def create(
         "system_disk_size": int(sys_disk_size) if sys_disk_size is not None else None,
         "system_disk_performance_level": sys_disk_pl,
         "erdma_enabled": erdma_final,
+        "erdma_v_switch_id": erdma_vsw if erdma_final else None,
         "erdma_network_interface_id": erdma_network_interface_id,
         "erdma_attached": False,
         "created_at": now_iso_utc(),
@@ -2129,7 +2354,7 @@ def delete(
 @app.command(no_args_is_help=True)
 def stop(
     ctx: typer.Context,
-    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+    name: str = typer.Argument(..., autocompletion=_complete_session_names, help="Session name or wildcard pattern, e.g. * or mpi*."),
     force: bool = typer.Option(False, "--force", help="Force stop the instance."),
     mode: str = typer.Option(
         "stop-charging",
@@ -2140,70 +2365,37 @@ def stop(
     timeout_seconds: int = typer.Option(300, "--timeout-seconds", help="Max seconds to wait for Stopped."),
     poll_interval_seconds: int = typer.Option(5, "--poll-interval-seconds", help="Polling interval seconds."),
 ) -> None:
-    """Stop the ECS instance for this session (to save cost)."""
+    """Stop one or more ECS instances for matching sessions (to save cost)."""
     path, state = _load(ctx)
     sessions = state.get("sessions") or {}
     if not isinstance(sessions, dict):
         _die("State file is corrupted: sessions is not a dict.")
-
-    sess = sessions.get(name)
-    if not isinstance(sess, dict):
-        _die(f"Session not found: {name}")
-
-    region = str(sess.get("region_id") or "")
-    instance_id = str(sess.get("instance_id") or "")
-    if not region or not instance_id:
-        _die(f"Session record missing region_id/instance_id: {name}")
-
-    mode_norm = (mode or "").strip().lower()
-    if mode_norm in {"stop-charging", "stopcharging", "stop_charging"}:
-        stopped_mode = "StopCharging"
-    elif mode_norm in {"keep-charging", "keepcharging", "keep_charging"}:
-        stopped_mode = "KeepCharging"
-    else:
-        _die("Invalid --mode. Use: stop-charging or keep-charging.")
-
-    try:
-        stop_instance(region_id=region, instance_id=instance_id, force=force, stopped_mode=stopped_mode)
-    except Exception as e:
-        # If StopCharging isn't supported for this instance, suggest KeepCharging.
-        if stopped_mode == "StopCharging":
-            typer.echo(
-                f"Stop failed with mode StopCharging: {e}\n"
-                f"Tip: try `ecs stop {name} --mode keep-charging`.",
-                err=True,
-            )
-        _die(f"Aliyun API error: {e}")
-
-    sess["status"] = "Stopping"
-    sess["last_refresh_at"] = now_iso_utc()
-    _save(path, state)
-    typer.echo(f"Stopping: {name} ({instance_id}) ...")
-
-    if wait:
+    targets = _resolve_session_targets(sessions, name)
+    failed: list[str] = []
+    for target in targets:
         try:
-            info = wait_instance_status(
-                region_id=region,
-                instance_id=instance_id,
-                desired_status="Stopped",
-                timeout_seconds=int(timeout_seconds),
-                poll_interval_seconds=int(poll_interval_seconds),
+            _stop_one_session(
+                path=path,
+                state=state,
+                name=target,
+                force=force,
+                mode=mode,
+                wait=wait,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
             )
-            sess["status"] = info.status
-            sess["public_ip"] = info.public_ip
-            sess["private_ip"] = info.private_ip
-            sess["last_refresh_at"] = now_iso_utc()
-            _save(path, state)
-            typer.echo("OK (Stopped)")
-        except TimeoutError as e:
-            typer.echo(str(e), err=True)
-            typer.echo("Tip: run `ecs sync` or `ecs info <name>` later.")
+        except typer.Exit:
+            failed.append(target)
+            if len(targets) == 1:
+                raise
+    if failed:
+        _die(f"Failed to stop {len(failed)}/{len(targets)} sessions: {', '.join(failed)}")
 
 
 @app.command(no_args_is_help=True)
 def start(
     ctx: typer.Context,
-    name: str = typer.Argument(..., autocompletion=_complete_session_names),
+    name: str = typer.Argument(..., autocompletion=_complete_session_names, help="Session name or wildcard pattern, e.g. * or mpi*."),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait until instance is Running."),
     timeout_seconds: int = typer.Option(300, "--timeout-seconds", help="Max seconds to wait for Running."),
     poll_interval_seconds: int = typer.Option(5, "--poll-interval-seconds", help="Polling interval seconds."),
@@ -2213,76 +2405,30 @@ def start(
         help="If enabled and no public IP is assigned, call AllocatePublicIpAddress. Default from config auto_allocate_public_ip.",
     ),
 ) -> None:
-    """Start the ECS instance for this session."""
+    """Start one or more ECS instances for matching sessions."""
     path, state = _load(ctx)
     sessions = state.get("sessions") or {}
     if not isinstance(sessions, dict):
         _die("State file is corrupted: sessions is not a dict.")
-
-    sess = sessions.get(name)
-    if not isinstance(sess, dict):
-        _die(f"Session not found: {name}")
-
-    cfg = state.get("config") or {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    region = str(sess.get("region_id") or "")
-    instance_id = str(sess.get("instance_id") or "")
-    if not region or not instance_id:
-        _die(f"Session record missing region_id/instance_id: {name}")
-
-    allocate_public_ip_final = (
-        bool(allocate_public_ip)
-        if allocate_public_ip is not None
-        else bool(cfg.get("auto_allocate_public_ip", True))
-    )
-
-    try:
-        start_instance(region_id=region, instance_id=instance_id)
-    except Exception as e:
-        _die(f"Aliyun API error: {e}")
-
-    sess["status"] = "Starting"
-    sess["last_refresh_at"] = now_iso_utc()
-    _save(path, state)
-    typer.echo(f"Starting: {name} ({instance_id}) ...")
-
-    if wait:
+    targets = _resolve_session_targets(sessions, name)
+    failed: list[str] = []
+    for target in targets:
         try:
-            info = wait_instance_status(
-                region_id=region,
-                instance_id=instance_id,
-                desired_status="Running",
-                timeout_seconds=int(timeout_seconds),
-                poll_interval_seconds=int(poll_interval_seconds),
+            _start_one_session(
+                path=path,
+                state=state,
+                name=target,
+                wait=wait,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                allocate_public_ip=allocate_public_ip,
             )
-            sess["status"] = info.status
-            sess["public_ip"] = info.public_ip
-            sess["private_ip"] = info.private_ip
-            sess["last_refresh_at"] = now_iso_utc()
-            _save(path, state)
-
-            if allocate_public_ip_final and not sess.get("public_ip"):
-                bw = int(cfg.get("internet_max_bandwidth_out") or 0)
-                if bw > 0:
-                    try:
-                        typer.echo("No public IP yet; allocating public IP via AllocatePublicIpAddress...")
-                        ip = allocate_public_ip_address(region_id=region, instance_id=instance_id)
-                        sess["public_ip"] = ip
-                        sess["last_refresh_at"] = now_iso_utc()
-                        _save(path, state)
-                    except Exception as e:
-                        typer.echo(
-                            f"Warning: failed to allocate public IP: {e}\n"
-                            f"Tip: you can still use `ecs connect {name} --private`, or bind an EIP.",
-                            err=True,
-                        )
-
-            typer.echo("OK (Running)")
-        except TimeoutError as e:
-            typer.echo(str(e), err=True)
-            typer.echo("Tip: run `ecs sync` or `ecs info <name>` later.")
+        except typer.Exit:
+            failed.append(target)
+            if len(targets) == 1:
+                raise
+    if failed:
+        _die(f"Failed to start {len(failed)}/{len(targets)} sessions: {', '.join(failed)}")
 
 
 @ssh_app.command("add", no_args_is_help=True)
@@ -2568,6 +2714,7 @@ def cluster_create(
     ),
     count: int = typer.Option(..., "--count", "-n", help="Number of nodes to create."),
     start_rank: int = typer.Option(0, "--start-rank", help="Start rank (default: 0)."),
+    stop: bool = typer.Option(False, "--stop", help="Stop each node after creation completes."),
 ) -> None:
     """Create a cluster by creating multiple instances from a template."""
     if int(count) < 1:
@@ -2646,6 +2793,18 @@ def cluster_create(
             crec["region_id"] = str(sess.get("region_id") or "")
         crec["updated_at"] = now_iso_utc()
         _save(path2, state2)
+
+        if stop:
+            _stop_one_session(
+                path=path2,
+                state=state2,
+                name=node_name,
+                force=False,
+                mode="stop-charging",
+                wait=True,
+                timeout_seconds=300,
+                poll_interval_seconds=5,
+            )
         created += 1
 
     typer.echo(f"OK: created cluster {name} with {created} nodes")
@@ -2663,6 +2822,7 @@ def cluster_expand(
         autocompletion=_complete_template_names,
         help="Optional template override. Default: cluster's template.",
     ),
+    stop: bool = typer.Option(False, "--stop", help="Stop each new node after creation completes."),
 ) -> None:
     """Expand a cluster by adding more nodes."""
     if int(count) < 1:
@@ -2736,9 +2896,143 @@ def cluster_expand(
             crec2["region_id"] = str(sess.get("region_id") or "")
         crec2["updated_at"] = now_iso_utc()
         _save(path2, state2)
+
+        if stop:
+            _stop_one_session(
+                path=path2,
+                state=state2,
+                name=node_name,
+                force=False,
+                mode="stop-charging",
+                wait=True,
+                timeout_seconds=300,
+                poll_interval_seconds=5,
+            )
         added += 1
 
     typer.echo(f"OK: expanded cluster {name} by {added} nodes")
+
+
+@cluster_app.command("stop", no_args_is_help=True)
+def cluster_stop(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_cluster_names, help="Cluster name."),
+    force: bool = typer.Option(False, "--force", help="Force stop the instances."),
+    mode: str = typer.Option(
+        "stop-charging",
+        "--mode",
+        help="stop-charging (recommended) or keep-charging.",
+    ),
+    wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait until instances are Stopped."),
+    timeout_seconds: int = typer.Option(300, "--timeout-seconds", help="Max seconds to wait for each node."),
+    poll_interval_seconds: int = typer.Option(5, "--poll-interval-seconds", help="Polling interval seconds."),
+) -> None:
+    """Stop all instances in a cluster."""
+    path, state = _load(ctx)
+    clusters = _ensure_clusters_dict(state)
+    crec = clusters.get(name)
+    if not isinstance(crec, dict):
+        _die(f"Cluster not found: {name}")
+
+    nodes = _cluster_nodes_from_record(crec)
+    if not nodes:
+        typer.echo("Cluster has no recorded nodes.")
+        return
+
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    failed: list[str] = []
+    stopped = 0
+    for rank, node in nodes:
+        node_name = str(node.get("name") or _cluster_node_name(name, rank))
+        if node_name not in sessions:
+            failed.append(node_name)
+            typer.echo(f"Warning: session record missing for node {node_name}; skipped.", err=True)
+            continue
+        try:
+            _stop_one_session(
+                path=path,
+                state=state,
+                name=node_name,
+                force=force,
+                mode=mode,
+                wait=wait,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+            stopped += 1
+        except typer.Exit:
+            failed.append(node_name)
+
+    crec["updated_at"] = now_iso_utc()
+    _save(path, state)
+
+    if failed:
+        _die(f"Cluster stop incomplete. Stopped: {stopped}, Failed/skipped: {len(failed)}")
+
+    typer.echo(f"OK: stopped cluster {name} ({stopped} nodes)")
+
+
+@cluster_app.command("start", no_args_is_help=True)
+def cluster_start(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., autocompletion=_complete_cluster_names, help="Cluster name."),
+    wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait until instances are Running."),
+    timeout_seconds: int = typer.Option(300, "--timeout-seconds", help="Max seconds to wait for each node."),
+    poll_interval_seconds: int = typer.Option(5, "--poll-interval-seconds", help="Polling interval seconds."),
+    allocate_public_ip: bool | None = typer.Option(
+        None,
+        "--allocate-public-ip/--no-allocate-public-ip",
+        help="If enabled and a node has no public IP, call AllocatePublicIpAddress. Default from config auto_allocate_public_ip.",
+    ),
+) -> None:
+    """Start all instances in a cluster."""
+    path, state = _load(ctx)
+    clusters = _ensure_clusters_dict(state)
+    crec = clusters.get(name)
+    if not isinstance(crec, dict):
+        _die(f"Cluster not found: {name}")
+
+    nodes = _cluster_nodes_from_record(crec)
+    if not nodes:
+        typer.echo("Cluster has no recorded nodes.")
+        return
+
+    sessions = state.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        _die("State file is corrupted: sessions is not a dict.")
+
+    failed: list[str] = []
+    started = 0
+    for rank, node in nodes:
+        node_name = str(node.get("name") or _cluster_node_name(name, rank))
+        if node_name not in sessions:
+            failed.append(node_name)
+            typer.echo(f"Warning: session record missing for node {node_name}; skipped.", err=True)
+            continue
+        try:
+            _start_one_session(
+                path=path,
+                state=state,
+                name=node_name,
+                wait=wait,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                allocate_public_ip=allocate_public_ip,
+            )
+            started += 1
+        except typer.Exit:
+            failed.append(node_name)
+
+    crec["updated_at"] = now_iso_utc()
+    _save(path, state)
+
+    if failed:
+        _die(f"Cluster start incomplete. Started: {started}, Failed/skipped: {len(failed)}")
+
+    typer.echo(f"OK: started cluster {name} ({started} nodes)")
 
 
 @cluster_app.command("delete", no_args_is_help=True)

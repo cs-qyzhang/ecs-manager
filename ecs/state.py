@@ -39,6 +39,16 @@ def default_config() -> dict[str, Any]:
         # If true, `ecs create` will attach an Elastic RDMA Interface (ERI) by creating a
         # secondary ENI with NetworkInterfaceTrafficMode=HighPerformance.
         "enable_erdma": False,
+        # Optional dedicated vSwitch for the ERI. If empty, reuse v_switch_id.
+        # Using a different vSwitch lets the ERI get an IP from a different subnet.
+        "erdma_v_switch_id": "",
+        # If true, enabling eRDMA will also auto-install the guest driver/software stack
+        # on first boot via ECS UserData (Linux-oriented), unless a custom user_data is
+        # explicitly provided.
+        "auto_install_erdma_driver": True,
+        # Optional startup script / cloud-init user-data passed to CreateInstance.
+        # Useful for first-boot package installs such as guest drivers.
+        "user_data": "",
         # System disk (optional; leave null to let Aliyun decide defaults)
         # Common categories: cloud_efficiency | cloud_ssd | cloud_essd | cloud_auto
         "system_disk_category": None,

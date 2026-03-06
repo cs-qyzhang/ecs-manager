@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -399,6 +400,7 @@ def create_instance(
     spot_price_limit: float | str | None = None,
     spot_duration: int | None = None,
     spot_interruption_behavior: str | None = None,
+    user_data: str | None = None,
 ) -> str:
     region_id, _ = normalize_region_id(region_id)
     client = ecs_client(region_id)
@@ -466,6 +468,17 @@ def create_instance(
         req.set_InternetMaxBandwidthOut(int(internet_max_bandwidth_out))
         if internet_charge_type:
             req.set_InternetChargeType(internet_charge_type)
+
+    if user_data is not None and str(user_data).strip() != "":
+        raw_user_data = str(user_data)
+        raw_user_data_bytes = raw_user_data.encode("utf-8")
+        if len(raw_user_data_bytes) > 32 * 1024:
+            raise EcsError("user_data is too large; raw content must be at most 32 KB before Base64 encoding")
+        encoded_user_data = base64.b64encode(raw_user_data_bytes).decode("ascii")
+        if hasattr(req, "set_UserData"):
+            req.set_UserData(encoded_user_data)
+        else:
+            raise EcsError("SDK does not support UserData on CreateInstanceRequest")
 
     resp = _do_action_json(client, req)
     instance_id = resp.get("InstanceId")
