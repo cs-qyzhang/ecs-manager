@@ -103,6 +103,12 @@ _load_dotenv_early()
 _suppress_noisy_ssl_warnings()
 
 
+def _normalize_typer_value(value: Any) -> Any:
+    if isinstance(value, typer.models.OptionInfo):
+        return None
+    return value
+
+
 def _sanitize_stuck_completion_env() -> None:
     """
     PowerShell completion invokes `ecs` in a subprocess with special env vars
@@ -166,30 +172,35 @@ app = typer.Typer(
 
 config_app = typer.Typer(
     help="Manage defaults stored in the JSON state file.",
+    no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(config_app, name="config")
 
 ssh_app = typer.Typer(
     help="Manage ~/.ssh/config entries for sessions.",
+    no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(ssh_app, name="ssh")
 
 template_app = typer.Typer(
     help="Manage reusable create templates stored in the state file.",
+    no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(template_app, name="template")
 
 port_app = typer.Typer(
     help="Manage security group port rules for instances.",
+    no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(port_app, name="port")
 
 cluster_app = typer.Typer(
     help="Manage clusters (groups of instances created from a template).",
+    no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(cluster_app, name="cluster")
@@ -485,7 +496,7 @@ def template_list(ctx: typer.Context) -> None:
         typer.echo(f"{n.ljust(name_w)}  {d}")
 
 
-@template_app.command("show")
+@template_app.command("show", no_args_is_help=True)
 def template_show(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_template_names),
@@ -501,7 +512,7 @@ def template_show(
     typer.echo(json.dumps(rec, ensure_ascii=False, indent=2))
 
 
-@template_app.command("edit")
+@template_app.command("edit", no_args_is_help=True)
 def template_edit(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_template_names, help="Template name."),
@@ -538,7 +549,7 @@ def template_edit(
     typer.echo("OK")
 
 
-@template_app.command("set")
+@template_app.command("set", no_args_is_help=True)
 def template_set(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Template name."),
@@ -582,7 +593,7 @@ def template_set(
     typer.echo("OK")
 
 
-@template_app.command("create")
+@template_app.command("create", no_args_is_help=True)
 def template_create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Template name."),
@@ -646,7 +657,7 @@ def template_create(
     typer.echo("OK")
 
 
-@template_app.command("unset")
+@template_app.command("unset", no_args_is_help=True)
 def template_unset(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_template_names),
@@ -671,7 +682,7 @@ def template_unset(
     typer.echo("OK")
 
 
-@template_app.command("delete")
+@template_app.command("delete", no_args_is_help=True)
 def template_delete(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_template_names),
@@ -700,7 +711,7 @@ def config_show(ctx: typer.Context) -> None:
     typer.echo(json.dumps(state.get("config", {}), ensure_ascii=False, indent=2))
 
 
-@config_app.command("set")
+@config_app.command("set", no_args_is_help=True)
 def config_set(
     ctx: typer.Context,
     pairs: list[str] = typer.Argument(
@@ -764,25 +775,65 @@ def list_sessions(ctx: typer.Context) -> None:
                 cluster_rank = int(s.get("cluster_rank"))
             except Exception:
                 cluster_rank = None
+        cluster_name_final = cluster_name.strip() if isinstance(cluster_name, str) else None
         rows.append(
             (
                 str(name),
                 str(s.get("status") or "-"),
                 str(s.get("public_ip") or "-"),
                 str(s.get("instance_id") or "-"),
-                str(cluster_name).strip() or None,
+                cluster_name_final or None,
                 cluster_rank,
             )
         )
 
-    name_w = max(len(r[0]) for r in rows)
-    status_w = max(len(r[1]) for r in rows)
-    ip_w = max(len(r[2]) for r in rows)
-    header = (
-        f"{'NAME'.ljust(name_w)}  {'STATUS'.ljust(status_w)}  {'PUBLIC_IP'.ljust(ip_w)}  INSTANCE_ID"
+    name_w = max(len("NAME"), max(len(r[0]) for r in rows))
+    status_w = max(len("STATUS"), max(len(r[1]) for r in rows))
+    ip_w = max(len("PUBLIC_IP"), max(len(r[2]) for r in rows))
+    cluster_w = max(len("CLUSTER"), max(len(r[4] or "") for r in rows))
+
+    def _cell(
+        value: str,
+        width: int,
+        *,
+        fg: str | None = None,
+        bold: bool = False,
+    ) -> str:
+        padded = value.ljust(width)
+        if fg is None and not bold:
+            return padded
+        return typer.style(padded, fg=fg, bold=bold)
+
+    def _status_cell(status: str) -> str:
+        normalized = status.strip().lower()
+        color = None
+        bold = False
+        if normalized == "running":
+            color = typer.colors.GREEN
+            bold = True
+        elif normalized in {"starting", "pending", "stopping"}:
+            color = typer.colors.YELLOW
+        elif normalized == "stopped":
+            color = typer.colors.BRIGHT_BLACK
+        elif normalized in {"error", "failed", "terminated", "missing"}:
+            color = typer.colors.RED
+            bold = True
+        return _cell(status, status_w, fg=color, bold=bold)
+
+    header_plain = (
+        f"{'NAME'.ljust(name_w)}  {'STATUS'.ljust(status_w)}  {'PUBLIC_IP'.ljust(ip_w)}  {'CLUSTER'.ljust(cluster_w)}  INSTANCE_ID"
+    )
+    header = "  ".join(
+        [
+            _cell("NAME", name_w, fg=typer.colors.CYAN, bold=True),
+            _cell("STATUS", status_w, fg=typer.colors.CYAN, bold=True),
+            _cell("PUBLIC_IP", ip_w, fg=typer.colors.CYAN, bold=True),
+            _cell("CLUSTER", cluster_w, fg=typer.colors.CYAN, bold=True),
+            typer.style("INSTANCE_ID", fg=typer.colors.CYAN, bold=True),
+        ]
     )
     typer.echo(header)
-    typer.echo("-" * len(header))
+    typer.echo(typer.style("-" * len(header_plain), fg=typer.colors.BRIGHT_BLACK))
 
     def _sort_key(r: tuple[str, str, str, str, str | None, int | None]) -> tuple[Any, ...]:
         cname = r[4]
@@ -791,10 +842,21 @@ def list_sessions(ctx: typer.Context) -> None:
         return (1, r[0])
 
     for r in sorted(rows, key=_sort_key):
-        typer.echo(f"{r[0].ljust(name_w)}  {r[1].ljust(status_w)}  {r[2].ljust(ip_w)}  {r[3]}")
+        cluster = r[4] or ""
+        typer.echo(
+            "  ".join(
+                [
+                    _cell(r[0], name_w, fg=typer.colors.WHITE, bold=True),
+                    _status_cell(r[1]),
+                    _cell(r[2], ip_w, fg=typer.colors.BLUE if r[2] != "-" else typer.colors.BRIGHT_BLACK),
+                    _cell(cluster, cluster_w, fg=typer.colors.MAGENTA if cluster else None),
+                    typer.style(r[3], fg=typer.colors.BRIGHT_BLACK),
+                ]
+            )
+        )
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def info(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -807,7 +869,7 @@ def info(
     typer.echo(json.dumps(sess, ensure_ascii=False, indent=2))
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Session name (used as the ECS InstanceName)."),
@@ -886,6 +948,30 @@ def create(
     poll_interval_seconds: int | None = typer.Option(None, "--poll-interval-seconds"),
 ) -> None:
     """Create a new ECS instance for a Codex session and record it locally."""
+    template = _normalize_typer_value(template)
+    hostname = _normalize_typer_value(hostname)
+    hostname_to_session = _normalize_typer_value(hostname_to_session)
+    region_id = _normalize_typer_value(region_id)
+    image_id = _normalize_typer_value(image_id)
+    instance_type = _normalize_typer_value(instance_type)
+    security_group_id = _normalize_typer_value(security_group_id)
+    v_switch_id = _normalize_typer_value(v_switch_id)
+    key_pair_name = _normalize_typer_value(key_pair_name)
+    system_disk_category = _normalize_typer_value(system_disk_category)
+    system_disk_size = _normalize_typer_value(system_disk_size)
+    system_disk_performance_level = _normalize_typer_value(system_disk_performance_level)
+    allocate_public_ip = _normalize_typer_value(allocate_public_ip)
+    erdma = _normalize_typer_value(erdma)
+    internet_max_bandwidth_out = _normalize_typer_value(internet_max_bandwidth_out)
+    internet_charge_type = _normalize_typer_value(internet_charge_type)
+    spot_strategy = _normalize_typer_value(spot_strategy)
+    spot_price_limit = _normalize_typer_value(spot_price_limit)
+    spot_duration = _normalize_typer_value(spot_duration)
+    spot_interruption_behavior = _normalize_typer_value(spot_interruption_behavior)
+    ssh_user = _normalize_typer_value(ssh_user)
+    timeout_seconds = _normalize_typer_value(timeout_seconds)
+    poll_interval_seconds = _normalize_typer_value(poll_interval_seconds)
+
     path, state = _load(ctx)
     sessions = state.get("sessions")
     if not isinstance(sessions, dict):
@@ -1317,7 +1403,7 @@ def create(
         )
 
 
-@app.command("public-ip")
+@app.command("public-ip", no_args_is_help=True)
 def public_ip(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -1638,7 +1724,7 @@ def sync(
     typer.echo(f"Updated: {updated}, Imported: {imported}")
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def rename(
     ctx: typer.Context,
     old: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -1688,7 +1774,7 @@ def rename(
     typer.echo("OK")
 
 
-@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@app.command(no_args_is_help=True, context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def connect(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -1794,7 +1880,7 @@ def connect(
     raise typer.Exit(subprocess.call(cmd))
 
 
-@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@app.command(no_args_is_help=True, context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def scp(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -1939,7 +2025,7 @@ def scp(
         _die("`scp` not found in PATH. Install OpenSSH client (Windows: Optional Features) or ensure scp is available.")
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def delete(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2025,7 +2111,7 @@ def delete(
     typer.echo("OK")
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def stop(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2099,7 +2185,7 @@ def stop(
             typer.echo("Tip: run `ecs sync` or `ecs info <name>` later.")
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def start(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2184,7 +2270,7 @@ def start(
             typer.echo("Tip: run `ecs sync` or `ecs info <name>` later.")
 
 
-@ssh_app.command("add")
+@ssh_app.command("add", no_args_is_help=True)
 def ssh_add(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2247,7 +2333,7 @@ def ssh_add(
     typer.echo(f"OK (added): Host {alias} -> {entry.user}@{entry.host_name}")
 
 
-@ssh_app.command("del")
+@ssh_app.command("del", no_args_is_help=True)
 def ssh_del(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2260,7 +2346,7 @@ def ssh_del(
         typer.echo("Not found")
 
 
-@port_app.command("list")
+@port_app.command("list", no_args_is_help=True)
 def port_list(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2321,7 +2407,7 @@ def port_list(
         _die(f"Aliyun API error: {e}")
 
 
-@port_app.command("open")
+@port_app.command("open", no_args_is_help=True)
 def port_open(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2375,7 +2461,7 @@ def port_open(
         _die(f"Aliyun API error: {e}")
 
 
-@port_app.command("close")
+@port_app.command("close", no_args_is_help=True)
 def port_close(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_session_names),
@@ -2454,7 +2540,7 @@ def _cluster_node_name(cluster_name: str, rank: int) -> str:
     return f"{cluster_name}-{rank}"
 
 
-@cluster_app.command("create")
+@cluster_app.command("create", no_args_is_help=True)
 def cluster_create(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Cluster name. Nodes are named <cluster>-<rank>."),
@@ -2550,7 +2636,7 @@ def cluster_create(
     typer.echo(f"OK: created cluster {name} with {created} nodes")
 
 
-@cluster_app.command("expand")
+@cluster_app.command("expand", no_args_is_help=True)
 def cluster_expand(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_cluster_names, help="Cluster name."),
@@ -2640,7 +2726,7 @@ def cluster_expand(
     typer.echo(f"OK: expanded cluster {name} by {added} nodes")
 
 
-@cluster_app.command("delete")
+@cluster_app.command("delete", no_args_is_help=True)
 def cluster_delete(
     ctx: typer.Context,
     name: str = typer.Argument(..., autocompletion=_complete_cluster_names, help="Cluster name."),
@@ -2742,6 +2828,7 @@ def cluster_list(
         sessions = {}
 
     rows: list[tuple[str, str, int]] = []
+    node_rows: list[tuple[str, str, str, str, str]] = []
     for cname, crec in clusters.items():
         if not isinstance(crec, dict):
             continue
@@ -2749,25 +2836,108 @@ def cluster_list(
         nodes = _cluster_nodes_from_record(crec)
         rows.append((str(cname), template, len(nodes)))
 
+        for rank, node in nodes:
+            node_name = str(node.get("name") or _cluster_node_name(str(cname), rank))
+            sess = sessions.get(node_name)
+            status = "-"
+            ip = "-"
+            instance_id = str(node.get("instance_id") or "-")
+            if isinstance(sess, dict):
+                status = str(sess.get("status") or "-")
+                ip = str(sess.get("public_ip") or sess.get("private_ip") or "-")
+                if instance_id == "-" or not instance_id.strip():
+                    instance_id = str(sess.get("instance_id") or "-")
+            node_rows.append((str(rank), node_name, status, ip, instance_id))
+
     if not rows:
         typer.echo("(no clusters)")
         return
 
-    name_w = max(len(r[0]) for r in rows)
-    tmpl_w = max(len(r[1]) for r in rows)
-    header = f"{'CLUSTER'.ljust(name_w)}  {'TEMPLATE'.ljust(tmpl_w)}  NODES"
-    typer.echo(header)
-    typer.echo("-" * len(header))
+    name_w = max(len("CLUSTER"), max(len(r[0]) for r in rows))
+    tmpl_w = max(len("TEMPLATE"), max(len(r[1]) for r in rows))
+    nodes_w = max(len("NODES"), max(len(str(r[2])) for r in rows))
+    rank_w = max(len("RANK"), max((len(r[0]) for r in node_rows), default=1))
+    node_name_w = max(len("NAME"), max((len(r[1]) for r in node_rows), default=1))
+    node_status_w = max(len("STATUS"), max((len(r[2]) for r in node_rows), default=1))
+    node_ip_w = max(len("IP"), max((len(r[3]) for r in node_rows), default=1))
 
-    for cname, tmpl, n in sorted(rows, key=lambda x: x[0]):
-        typer.echo(f"{cname.ljust(name_w)}  {tmpl.ljust(tmpl_w)}  {n}")
+    def _cell(
+        value: str,
+        width: int,
+        *,
+        align: str = "left",
+        fg: str | None = None,
+        bold: bool = False,
+        dim: bool = False,
+    ) -> str:
+        padded = value.ljust(width) if align == "left" else value.rjust(width)
+        if fg is None and not bold and not dim:
+            return padded
+        return typer.style(padded, fg=fg, bold=bold, dim=dim)
+
+    def _status_cell(status: str) -> str:
+        normalized = status.strip().lower()
+        color = None
+        bold = False
+        if normalized == "running":
+            color = typer.colors.GREEN
+            bold = True
+        elif normalized in {"starting", "pending", "stopping"}:
+            color = typer.colors.YELLOW
+        elif normalized in {"stopped"}:
+            color = typer.colors.BRIGHT_BLACK
+        elif normalized in {"error", "failed", "terminated", "missing"}:
+            color = typer.colors.RED
+            bold = True
+        return _cell(status, node_status_w, fg=color, bold=bold)
+
+    header_plain = f"{'CLUSTER'.ljust(name_w)}  {'TEMPLATE'.ljust(tmpl_w)}  {'NODES'.rjust(nodes_w)}"
+    header = "  ".join(
+        [
+            _cell("CLUSTER", name_w, fg=typer.colors.CYAN, bold=True),
+            _cell("TEMPLATE", tmpl_w, fg=typer.colors.CYAN, bold=True),
+            _cell("NODES", nodes_w, align="right", fg=typer.colors.CYAN, bold=True),
+        ]
+    )
+    typer.echo(header)
+    typer.echo(typer.style("-" * len(header_plain), fg=typer.colors.BRIGHT_BLACK))
+
+    sorted_rows = sorted(rows, key=lambda x: x[0])
+    for idx, (cname, tmpl, n) in enumerate(sorted_rows):
+        typer.echo(
+            "  ".join(
+                [
+                    _cell(cname, name_w, fg=typer.colors.BRIGHT_CYAN, bold=True),
+                    _cell(tmpl, tmpl_w, fg=typer.colors.MAGENTA),
+                    _cell(str(n), nodes_w, align="right", fg=typer.colors.YELLOW, bold=True),
+                ]
+            )
+        )
         if not show_nodes:
+            if idx != len(sorted_rows) - 1:
+                typer.echo("")
             continue
 
         crec = clusters.get(cname)
         if not isinstance(crec, dict):
             continue
         nodes = _cluster_nodes_from_record(crec)
+        if nodes:
+            node_header_plain = (
+                f"  {'RANK'.rjust(rank_w)}  {'NAME'.ljust(node_name_w)}  {'STATUS'.ljust(node_status_w)}  {'IP'.ljust(node_ip_w)}  INSTANCE_ID"
+            )
+            typer.echo(
+                "  "
+                + "  ".join(
+                    [
+                        _cell("RANK", rank_w, align="right", fg=typer.colors.BRIGHT_BLACK, bold=True),
+                        _cell("NAME", node_name_w, fg=typer.colors.BRIGHT_BLACK, bold=True),
+                        _cell("STATUS", node_status_w, fg=typer.colors.BRIGHT_BLACK, bold=True),
+                        _cell("IP", node_ip_w, fg=typer.colors.BRIGHT_BLACK, bold=True),
+                        typer.style("INSTANCE_ID", fg=typer.colors.BRIGHT_BLACK, bold=True),
+                    ]
+                )
+            )
         for rank, node in nodes:
             node_name = str(node.get("name") or _cluster_node_name(cname, rank))
             sess = sessions.get(node_name)
@@ -2779,5 +2949,18 @@ def cluster_list(
                 ip = str(sess.get("public_ip") or sess.get("private_ip") or "-")
                 if instance_id == "-" or not instance_id.strip():
                     instance_id = str(sess.get("instance_id") or "-")
-            typer.echo(f"  {str(rank).rjust(3)}  {node_name}  {status}  {ip}  {instance_id}")
+            typer.echo(
+                "  "
+                + "  ".join(
+                    [
+                        _cell(str(rank), rank_w, align="right", fg=typer.colors.BRIGHT_BLACK),
+                        _cell(node_name, node_name_w, fg=typer.colors.WHITE),
+                        _status_cell(status),
+                        _cell(ip, node_ip_w, fg=typer.colors.BLUE if ip != "-" else typer.colors.BRIGHT_BLACK),
+                        typer.style(instance_id, fg=typer.colors.BRIGHT_BLACK),
+                    ]
+                )
+            )
+        if idx != len(sorted_rows) - 1:
+            typer.echo("")
 
